@@ -4,6 +4,12 @@ An LM Studio reimplementation in Rust — same backends, same desktop UI,
 plus **Strata** and **Maya** as first-class backends. Design and
 rationale: [DESIGN.md](DESIGN.md).
 
+> **Personal project.** QuackStudio is a personal app, built for one
+> person's own setup and published as-is. It may not remain maintained —
+> development happens in bursts, and issues or pull requests may go
+> unanswered for long stretches, or forever. Use it at your own risk;
+> no support is promised.
+
 Three pieces, mirroring LM Studio's split (daemon + app + CLI), all Rust:
 
 - **`quackd`** — headless daemon (their `llmster` analogue). Owns the
@@ -87,4 +93,4 @@ cargo tauri build
 P0 scaffold (this) → P1 llama.cpp pack end-to-end → P2 MLX + load
 config → P3 Strata + Maya packs → P4 Discover/downloads/Settings →
 P5 publish to GitHub under Franzferdinan51. Full detail in
-[DESIGN.md](DESIGN.md).
+[../DESIGN.md](../DESIGN.md).

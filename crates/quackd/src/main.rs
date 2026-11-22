@@ -12,6 +12,13 @@
 //!   GET  /api/v1/downloads       download jobs with progress
 //!   GET  /api/v1/settings        effective settings
 //!   POST /api/v1/settings        persist + apply settings
+//!   GET  /api/v1/model-configs   per-model configs (load +
+//!                                inference + pinned), persisted
+//!                                in the settings dir
+//!   POST /api/v1/model-configs   upsert one model's config
+//!   POST /api/v1/models/reveal   reveal a model folder (or the
+//!                                models dir) in Finder
+//!   POST /api/v1/models/delete   delete a local model's folder
 //!   GET  /v1/models              OpenAI-compat list (loaded only,
 //!                                plus Maya remote models)
 //!   POST /v1/chat/completions    proxy to the instance's engine (SSE passthrough)
@@ -145,6 +152,10 @@ struct AppState {
     /// flags, model defaults) — the rest of settings.json beside
     /// the Maya provider list.
     persisted: RwLock<PersistedSettings>,
+    /// Per-model configs (Library detail panel: load overrides,
+    /// inference defaults, pins), persisted in the settings dir
+    /// as `model-configs.json`, keyed by library model key.
+    model_configs: RwLock<HashMap<String, ModelConfig>>,
 }
 
 /// How many daemon log lines the ring buffer keeps.
@@ -449,6 +460,11 @@ fn maya_entry(status: &MayaProviderStatus, model_id: &str) -> ModelWithInstances
             path: PathBuf::new(),
             arch: None,
             vision: false,
+            file_name: None,
+            quantization: None,
+            max_context: None,
+            domain: "llm".to_string(),
+            warnings: Vec::new(),
             remote_url: Some(status.base_url.clone()),
         },
         loaded_instances: vec![Instance {
@@ -731,31 +747,17 @@ async fn register_instance(
 /// Splash pack's `splash_engine` server. On success the instance
 /// is registered and returned. Maya entries never reach here:
 /// they are not in the local library scan, and their loads are
-/// answered by `maya_load` before local resolution.
-/// Advanced llama.cpp load knobs from the Library Load tab.
-/// Each maps to one llama-server flag when present; the MLX
-/// spawner ignores them (mlx_vlm.server has no equivalents).
-#[derive(Default, Clone, Copy)]
-struct LoadKnobs {
-    /// `-t` — CPU thread pool size.
-    n_threads: Option<u32>,
-    /// `-b` — evaluation (logical) batch size.
-    eval_batch_size: Option<u32>,
-    /// `-ub` — physical batch size.
-    physical_batch_size: Option<u32>,
-}
-
+/// answered by `maya_load` before local resolution. The load
+/// config applies to the GGUF spawner; the MLX and Splash
+/// spawners have no equivalents and ignore it (their Library
+/// panels label the fields as not applied).
 async fn spawn_instance(
     state: &Arc<AppState>,
     entry: &ModelEntry,
-    context_length: Option<u32>,
-    gpu_offload: Option<u32>,
-    knobs: LoadKnobs,
+    config: &StoredLoadConfig,
 ) -> Result<Instance, LoadError> {
     match entry.format {
-        ModelFormat::Gguf => {
-            spawn_llama_instance(state, entry, context_length, gpu_offload, knobs).await
-        }
+        ModelFormat::Gguf => spawn_llama_instance(state, entry, config).await,
         ModelFormat::Mlx => spawn_mlx_instance(state, entry).await,
         ModelFormat::Splash => spawn_splash_instance(state, entry).await,
         ModelFormat::Maya => Err(load_error(
@@ -765,13 +767,56 @@ async fn spawn_instance(
     }
 }
 
+/// Split a raw arguments string the way a shell would (single /
+/// double quotes, backslash escapes) — for the Library Load
+/// tab's llama.cpp Arguments Override field.
+fn shell_split(input: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let mut started = false;
+    for ch in input.chars() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            continue;
+        }
+        match (quote, ch) {
+            (_, '\\') => escaped = true,
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), c) => current.push(c),
+            (None, '\'' | '"') => {
+                quote = Some(ch);
+                started = true;
+            }
+            (None, c) if c.is_whitespace() => {
+                if started || !current.is_empty() {
+                    args.push(std::mem::take(&mut current));
+                    started = false;
+                }
+            }
+            (None, c) => current.push(c),
+        }
+    }
+    if escaped {
+        current.push('\\');
+    }
+    if started || !current.is_empty() {
+        args.push(current);
+    }
+    args
+}
+
 /// Spawn llama-server for a GGUF entry and wait for its `/health`.
+/// Every load-config field with a verified llama-server 2.80.1
+/// flag is applied (see StoredLoadConfig's field notes); the
+/// stored-only fields (num_experts, num_layers_offload,
+/// moe_expert) never reach the command line.
 async fn spawn_llama_instance(
     state: &Arc<AppState>,
     entry: &ModelEntry,
-    context_length: Option<u32>,
-    gpu_offload: Option<u32>,
-    knobs: LoadKnobs,
+    cfg: &StoredLoadConfig,
 ) -> Result<Instance, LoadError> {
     let server = llama_server_binary(state).ok_or_else(|| {
         load_error(
@@ -789,8 +834,30 @@ async fn spawn_llama_instance(
         )
     })?;
 
+    // Speculative decoding: resolve the drafter model key to its
+    // main GGUF file before spawning, so a bad key fails the load
+    // with a clear message instead of a dead engine.
+    let draft_path = match cfg.speculative_decoding.as_deref() {
+        None | Some("") | Some("off") => None,
+        Some(drafter_key) => {
+            let drafter = resolve_model(state, drafter_key).ok_or_else(|| {
+                load_error(
+                    StatusCode::BAD_REQUEST,
+                    format!("speculative decoding drafter not in the library: {drafter_key}"),
+                )
+            })?;
+            Some(main_gguf_path(&drafter).ok_or_else(|| {
+                load_error(
+                    StatusCode::BAD_REQUEST,
+                    format!("speculative decoding drafter {drafter_key} has no main GGUF file"),
+                )
+            })?)
+        }
+    };
+
     let port = state.next_port.fetch_add(1, Ordering::SeqCst);
     let (log_file, log_file_err, log_path) = create_engine_log("llama", entry, port)?;
+    let context_length = cfg.context_length;
 
     let mut cmd = Command::new(&server);
     cmd.arg("--model")
@@ -802,18 +869,100 @@ async fn spawn_llama_instance(
         .arg("--ctx-size")
         .arg(context_length.unwrap_or(8192).to_string())
         .arg("--n-gpu-layers")
-        .arg(gpu_offload.unwrap_or(999).to_string())
+        .arg(cfg.gpu_offload.unwrap_or(999).to_string())
         .arg("--jinja");
-    // Advanced knobs (Library Load tab) — only when the caller
-    // set them, so llama-server's own defaults rule otherwise.
-    if let Some(n) = knobs.n_threads {
+    // Advanced knobs (Library Load tab) — only when set, so
+    // llama-server's own defaults rule otherwise. Flag names
+    // verified against the installed llama-server 2.80.1 --help.
+    if let Some(n) = cfg.cpu_threads {
         cmd.arg("-t").arg(n.to_string());
     }
-    if let Some(n) = knobs.eval_batch_size {
+    if let Some(n) = cfg.eval_batch_size {
         cmd.arg("-b").arg(n.to_string());
     }
-    if let Some(n) = knobs.physical_batch_size {
+    if let Some(n) = cfg.physical_batch_size {
         cmd.arg("-ub").arg(n.to_string());
+    }
+    if let Some(n) = cfg.max_concurrent {
+        cmd.arg("--parallel").arg(n.to_string());
+    }
+    match cfg.unified_kv_cache {
+        Some(true) => {
+            cmd.arg("--kv-unified");
+        }
+        Some(false) => {
+            cmd.arg("--no-kv-unified");
+        }
+        None => {}
+    }
+    if let Some(n) = cfg.context_checkpoints {
+        cmd.arg("--ctx-checkpoints").arg(n.to_string());
+    }
+    if let Some(message) = &cfg.reasoning_budget_message {
+        if !message.is_empty() {
+            cmd.arg("--reasoning-budget-message").arg(message);
+        }
+    }
+    if let Some(v) = cfg.rope_freq_base {
+        cmd.arg("--rope-freq-base").arg(v.to_string());
+    }
+    if let Some(v) = cfg.rope_freq_scale {
+        cmd.arg("--rope-freq-scale").arg(v.to_string());
+    }
+    match cfg.kv_offload {
+        Some(true) => {
+            cmd.arg("--kv-offload");
+        }
+        Some(false) => {
+            cmd.arg("--no-kv-offload");
+        }
+        None => {}
+    }
+    // Keep-in-memory / try-mmap combine into --load-mode
+    // (llama.cpp's current spelling of --mlock / --mmap). An
+    // unset partner takes LM Studio's default (on).
+    if cfg.keep_in_memory.is_some() || cfg.try_mmap.is_some() {
+        let keep = cfg.keep_in_memory.unwrap_or(true);
+        let mmap = cfg.try_mmap.unwrap_or(true);
+        let mode = match (keep, mmap) {
+            (true, true) => "mmap+mlock",
+            (true, false) => "mlock",
+            (false, true) => "mmap",
+            (false, false) => "none",
+        };
+        cmd.arg("--load-mode").arg(mode);
+    }
+    if let Some(mode) = &cfg.on_demand_tensor_loading {
+        if matches!(mode.as_str(), "auto" | "on" | "off") {
+            cmd.arg("--lazy-mode").arg(mode);
+        }
+    }
+    if let Some(seed) = cfg.seed {
+        cmd.arg("--seed").arg(seed.to_string());
+    }
+    if let Some(draft) = &draft_path {
+        cmd.arg("--model-draft").arg(draft);
+    }
+    if let Some(template) = &cfg.chat_template {
+        if !template.is_empty() {
+            cmd.arg("--chat-template").arg(template);
+        }
+    }
+    if let Some(on) = cfg.flash_attention {
+        cmd.arg("--flash-attn").arg(if on { "on" } else { "off" });
+    }
+    if let Some(t) = &cfg.cache_type_k {
+        cmd.arg("--cache-type-k").arg(t);
+    }
+    if let Some(t) = &cfg.cache_type_v {
+        cmd.arg("--cache-type-v").arg(t);
+    }
+    // The Arguments Override goes last, verbatim (shell-split),
+    // so it can refine anything above it.
+    if let Some(extra) = &cfg.args_override {
+        for arg in shell_split(extra) {
+            cmd.arg(arg);
+        }
     }
     let mut child = cmd
         .stdin(Stdio::null())
@@ -1133,15 +1282,50 @@ async fn spawn_splash_instance(
 #[derive(serde::Deserialize)]
 struct LoadRequest {
     model: String,
-    context_length: Option<u32>,
-    /// Passed to llama-server as `--n-gpu-layers` (default 999 =
-    /// offload everything, LM Studio's Metal behaviour).
-    gpu_offload: Option<f64>,
-    /// Advanced llama.cpp knobs (Library Load tab's Advanced
-    /// section): `-t`, `-b`, `-ub`. Ignored for MLX loads.
+    /// The request's load-config fields ride flattened alongside
+    /// `model` (same snake_case names as the stored config).
+    /// Fields present here override the model's stored config
+    /// for this load; absent fields inherit it.
+    #[serde(flatten)]
+    config: StoredLoadConfig,
+    /// Legacy alias for `cpu_threads` (the P5 UI's name).
     n_threads: Option<u32>,
-    eval_batch_size: Option<u32>,
-    physical_batch_size: Option<u32>,
+}
+
+/// Overlay `over` onto `base`: every field set in `over` wins.
+/// Implemented through JSON so the field list lives in exactly
+/// one place (the struct definition).
+fn merge_load_config(base: &StoredLoadConfig, over: &StoredLoadConfig) -> StoredLoadConfig {
+    let mut merged = serde_json::to_value(base).unwrap_or(serde_json::Value::Null);
+    let over = serde_json::to_value(over).unwrap_or(serde_json::Value::Null);
+    if let (Some(m), Some(o)) = (merged.as_object_mut(), over.as_object()) {
+        for (key, value) in o {
+            if !value.is_null() {
+                m.insert(key.clone(), value.clone());
+            }
+        }
+    }
+    serde_json::from_value(merged).unwrap_or_default()
+}
+
+/// The effective load config for a model: its stored config with
+/// the request's fields overlaid.
+async fn effective_load_config(
+    state: &Arc<AppState>,
+    key: &str,
+    request: Option<&StoredLoadConfig>,
+) -> StoredLoadConfig {
+    let stored = state
+        .model_configs
+        .read()
+        .await
+        .get(key)
+        .map(|config| config.load.clone())
+        .unwrap_or_default();
+    match request {
+        Some(over) => merge_load_config(&stored, over),
+        None => stored,
+    }
 }
 
 /// Load for a Maya key (`maya/<provider>/<model-id>`): there is
@@ -1204,16 +1388,15 @@ async fn load_model(
         );
     };
     // Format dispatch (GGUF / MLX / Splash) lives in
-    // spawn_instance; context_length and gpu_offload are GGUF-only
-    // knobs today and are ignored by the MLX and Splash spawners.
-    let gpu_offload = req.gpu_offload.map(|v| v.round() as u32);
-    let knobs = LoadKnobs {
-        n_threads: req.n_threads,
-        eval_batch_size: req.eval_batch_size,
-        physical_batch_size: req.physical_batch_size,
-    };
+    // spawn_instance; the load config applies to GGUF loads and
+    // is ignored by the MLX and Splash spawners.
+    let mut request_config = req.config.clone();
+    if request_config.cpu_threads.is_none() {
+        request_config.cpu_threads = req.n_threads;
+    }
+    let config = effective_load_config(&state, &entry.key, Some(&request_config)).await;
     let started = Instant::now();
-    match spawn_instance(&state, &entry, req.context_length, gpu_offload, knobs).await {
+    match spawn_instance(&state, &entry, &config).await {
         Ok(instance) => {
             log_line(
                 &state,
@@ -1621,6 +1804,396 @@ async fn list_downloads(State(state): State<Arc<AppState>>) -> Json<Vec<Download
 }
 
 // ---------------------------------------------------------------------------
+// Per-model configs (Library detail panel)
+// ---------------------------------------------------------------------------
+
+/// Per-model load configuration: the Library Load tab's fields,
+/// persisted in `model-configs.json` and sent (flattened) on load
+/// requests. Every field is optional — `None` means "not set",
+/// which is both the engine default at spawn time and "not
+/// customized" in the UI. Flag mappings were verified against
+/// the installed llama-server 2.80.1 `--help`; fields with no
+/// honest flag stay stored-only and the UI labels them as such.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, serde::Deserialize)]
+#[serde(default)]
+struct StoredLoadConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    context_length: Option<u32>,
+    /// GPU offload as a layer count (`--n-gpu-layers`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    gpu_offload: Option<u32>,
+    /// `-t` CPU thread pool size.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cpu_threads: Option<u32>,
+    /// `-b` evaluation (logical) batch size.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    eval_batch_size: Option<u32>,
+    /// `-ub` physical batch size.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    physical_batch_size: Option<u32>,
+    /// `--parallel` server slots.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_concurrent: Option<u32>,
+    /// `--kv-unified` / `--no-kv-unified`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unified_kv_cache: Option<bool>,
+    /// `--ctx-checkpoints`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    context_checkpoints: Option<u32>,
+    /// `--reasoning-budget-message`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_budget_message: Option<String>,
+    /// `--rope-freq-base`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rope_freq_base: Option<f32>,
+    /// `--rope-freq-scale`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rope_freq_scale: Option<f32>,
+    /// KV cache offload to GPU (llama.cpp's default); `false`
+    /// maps to `--no-kv-offload`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kv_offload: Option<bool>,
+    /// Combined with `try_mmap` into `--load-mode` (mlock side).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    keep_in_memory: Option<bool>,
+    /// Combined with `keep_in_memory` into `--load-mode`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    try_mmap: Option<bool>,
+    /// `--lazy-mode`: "auto" | "on" | "off".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    on_demand_tensor_loading: Option<String>,
+    /// `--seed` (the UI sends it only while Seed is enabled).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    seed: Option<i64>,
+    /// Stored only: llama.cpp's `--n-cpu-moe` counts *layers* of
+    /// MoE weights kept on CPU, not experts — no honest mapping.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    num_experts: Option<u32>,
+    /// Stored only: GPU layer offload is `gpu_offload` above;
+    /// this LM Studio field has no separate flag.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    num_layers_offload: Option<u32>,
+    /// Stored only: no llama.cpp equivalent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    moe_expert: Option<u32>,
+    /// Drafter model key for `--model-draft`; "off"/empty = off.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    speculative_decoding: Option<String>,
+    /// `--chat-template`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chat_template: Option<String>,
+    /// `--flash-attn on|off`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    flash_attention: Option<bool>,
+    /// `--cache-type-k` (llama.cpp type name, e.g. "q8_0").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_type_k: Option<String>,
+    /// `--cache-type-v`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_type_v: Option<String>,
+    /// Raw extra llama-server arguments (shell-split, appended
+    /// last) — the Arguments Override field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    args_override: Option<String>,
+}
+
+/// Per-model inference defaults: the Library Inference tab's
+/// fields. The chat proxy merges these into requests for the
+/// model, filling only fields the request itself leaves unset.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, serde::Deserialize)]
+#[serde(default)]
+struct InferenceConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    system_prompt: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_budget_enabled: Option<bool>,
+    /// Stored only: the proxy has no per-request reasoning-budget
+    /// field to fill on the engines we drive.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_budget: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    limit_response_length: Option<bool>,
+    /// Sent as `max_tokens` when `limit_response_length` is on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_response_tokens: Option<u32>,
+    /// "truncate_middle" makes the proxy drop middle messages
+    /// when a conversation outgrows the instance's context.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    context_overflow: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    stop_strings: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_k: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repeat_penalty_enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repeat_penalty: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    presence_penalty_enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    presence_penalty: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_p_enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_p: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    min_p_enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    min_p: Option<f32>,
+    /// When on, the proxy fills `response_format:
+    /// {"type": "json_object"}` on requests that lack one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    structured_output: Option<bool>,
+}
+
+impl InferenceConfig {
+    fn is_empty(&self) -> bool {
+        *self == InferenceConfig::default()
+    }
+}
+
+/// One model's persisted config: load overrides + inference
+/// defaults + the Library pin.
+#[derive(Debug, Clone, Default, Serialize, serde::Deserialize)]
+#[serde(default)]
+struct ModelConfig {
+    load: StoredLoadConfig,
+    inference: InferenceConfig,
+    pinned: bool,
+}
+
+/// The config store at startup (`<settings_dir>/model-configs.json`).
+/// A missing or corrupt file means an empty store.
+fn read_model_configs(dir: &Path) -> HashMap<String, ModelConfig> {
+    let Ok(text) = std::fs::read_to_string(dir.join("model-configs.json")) else {
+        return HashMap::new();
+    };
+    serde_json::from_str(&text).unwrap_or_default()
+}
+
+/// Persist the whole store. Called with the in-memory map already
+/// updated; a failed write is reported to the caller.
+async fn save_model_configs(state: &Arc<AppState>) -> Result<(), String> {
+    let text = {
+        let configs = state.model_configs.read().await;
+        serde_json::to_string_pretty(&*configs).unwrap_or_default()
+    };
+    tokio::fs::create_dir_all(&state.settings_dir)
+        .await
+        .map_err(|e| format!("cannot create the settings directory: {e}"))?;
+    tokio::fs::write(state.settings_dir.join("model-configs.json"), text)
+        .await
+        .map_err(|e| format!("cannot write model-configs.json: {e}"))
+}
+
+/// GET /api/v1/model-configs — every model's persisted config.
+async fn get_model_configs(
+    State(state): State<Arc<AppState>>,
+) -> Json<HashMap<String, ModelConfig>> {
+    Json(state.model_configs.read().await.clone())
+}
+
+#[derive(serde::Deserialize)]
+struct ModelConfigRequest {
+    key: String,
+    load: Option<StoredLoadConfig>,
+    inference: Option<InferenceConfig>,
+    pinned: Option<bool>,
+}
+
+/// POST /api/v1/model-configs — replace the provided sections of
+/// one model's config and persist. Answers with the model's
+/// full updated config.
+async fn update_model_config(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<ModelConfigRequest>,
+) -> Response {
+    let key = req.key.trim().to_string();
+    if key.is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "model key must not be empty");
+    }
+    let updated = {
+        let mut configs = state.model_configs.write().await;
+        let entry = configs.entry(key.clone()).or_default();
+        if let Some(load) = req.load {
+            entry.load = load;
+        }
+        if let Some(inference) = req.inference {
+            entry.inference = inference;
+        }
+        if let Some(pinned) = req.pinned {
+            entry.pinned = pinned;
+        }
+        entry.clone()
+    };
+    if let Err(message) = save_model_configs(&state).await {
+        return error_response(StatusCode::INTERNAL_SERVER_ERROR, message);
+    }
+    log_line(&state, format!("model config updated: {key}")).await;
+    Json(updated).into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct RevealRequest {
+    key: Option<String>,
+    path: Option<String>,
+}
+
+/// POST /api/v1/models/reveal — reveal a model's folder (by key)
+/// or the models directory itself (by path, e.g. from the
+/// Library footer's directory menu) in Finder. Paths outside
+/// the models directory are refused.
+async fn reveal_path(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<RevealRequest>,
+) -> Response {
+    let target: PathBuf = if let Some(key) = &req.key {
+        if key.starts_with("maya/") {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "Maya models are remote — there is no local folder to reveal",
+            );
+        }
+        match resolve_model(&state, key) {
+            Some(entry) => entry.path,
+            None => {
+                return error_response(
+                    StatusCode::NOT_FOUND,
+                    format!("model not found in the library: {key}"),
+                )
+            }
+        }
+    } else if let Some(path) = &req.path {
+        let root = state
+            .models_dir
+            .canonicalize()
+            .unwrap_or_else(|_| state.models_dir.clone());
+        let Ok(canon) = PathBuf::from(path).canonicalize() else {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                format!("path does not exist: {path}"),
+            );
+        };
+        if canon != root && !canon.starts_with(&root) {
+            return error_response(
+                StatusCode::FORBIDDEN,
+                "only the models directory and its contents can be revealed",
+            );
+        }
+        canon
+    } else {
+        return error_response(StatusCode::BAD_REQUEST, "provide a model key or a path");
+    };
+    #[cfg(target_os = "macos")]
+    {
+        match std::process::Command::new("open")
+            .arg("-R")
+            .arg(&target)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(_) => (
+                StatusCode::OK,
+                Json(serde_json::json!({ "status": "revealed" })),
+            )
+                .into_response(),
+            Err(e) => error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to launch Finder: {e}"),
+            ),
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = target;
+        error_response(
+            StatusCode::NOT_IMPLEMENTED,
+            "Reveal in Finder is only available on macOS",
+        )
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct DeleteRequest {
+    key: String,
+}
+
+/// POST /api/v1/models/delete — delete a local model's folder
+/// from disk (the Library's More Actions → Delete, behind the
+/// UI's confirm dialog). Refuses remote models, loaded models,
+/// and anything whose on-disk path is not exactly the scanned
+/// `<models_dir>/<publisher>/<model>` directory. The model's
+/// persisted config goes with it.
+async fn delete_model(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<DeleteRequest>,
+) -> Response {
+    if req.key.starts_with("maya/") {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "Maya models are remote — there is nothing local to delete",
+        );
+    }
+    let Some(entry) = resolve_model(&state, &req.key) else {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            format!("model not found in the library: {}", req.key),
+        );
+    };
+    {
+        let instances = state.instances.read().await;
+        if instances
+            .values()
+            .any(|loaded| loaded.instance.model_key == entry.key)
+        {
+            return error_response(
+                StatusCode::CONFLICT,
+                format!("{} is loaded — unload it before deleting", entry.key),
+            );
+        }
+    }
+    // The path must be exactly the two-level library directory
+    // the scanner found — never a caller-shaped path.
+    let expected = state
+        .models_dir
+        .join(&entry.publisher)
+        .join(&entry.display_name);
+    let path_ok = entry.path == expected
+        || entry.path.canonicalize().ok() == expected.canonicalize().ok();
+    if !path_ok {
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!(
+                "refusing to delete {}: not a library model directory",
+                entry.path.display()
+            ),
+        );
+    }
+    if let Err(e) = tokio::fs::remove_dir_all(&entry.path).await {
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to delete {}: {e}", entry.path.display()),
+        );
+    }
+    // The persisted config belongs to the deleted model.
+    {
+        let mut configs = state.model_configs.write().await;
+        configs.remove(&entry.key);
+    }
+    let _ = save_model_configs(&state).await;
+    log_line(&state, format!("deleted model {}", entry.key)).await;
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "status": "deleted" })),
+    )
+        .into_response()
+}
+
+// ---------------------------------------------------------------------------
 // Settings
 // ---------------------------------------------------------------------------
 
@@ -1891,31 +2464,196 @@ async fn update_settings(
 
 /// Resolve a chat request naming a Maya model — by full entry
 /// key (`maya/<provider>/<model-id>`) or by the provider's bare
-/// model id — to `(provider base_url, provider model id)`. The
-/// model id is what the request body's `model` field must carry
-/// for the provider. `None` when no answering provider serves it.
+/// model id — to `(provider base_url, provider model id, library
+/// key)`. The model id is what the request body's `model` field
+/// must carry for the provider; the library key is the model's
+/// per-model config key. `None` when no answering provider
+/// serves it.
 async fn resolve_maya_target(
     state: &Arc<AppState>,
     requested: &str,
-) -> Option<(String, String)> {
+) -> Option<(String, String, String)> {
     let snapshot = maya_snapshot(state).await;
     if let Some(rest) = requested.strip_prefix("maya/") {
         let (provider_name, model_id) = rest.split_once('/')?;
         let provider = snapshot.iter().find(|s| s.name == provider_name)?;
         let models = provider.models.as_ref()?;
         if models.iter().any(|m| m == model_id) {
-            return Some((provider.base_url.clone(), model_id.to_string()));
+            return Some((
+                provider.base_url.clone(),
+                model_id.to_string(),
+                requested.to_string(),
+            ));
         }
         return None;
     }
     for provider in &snapshot {
         if let Some(models) = &provider.models {
             if models.iter().any(|m| m == requested) {
-                return Some((provider.base_url.clone(), requested.to_string()));
+                return Some((
+                    provider.base_url.clone(),
+                    requested.to_string(),
+                    format!("maya/{}/{}", provider.name, requested),
+                ));
             }
         }
     }
     None
+}
+
+/// Rough token estimate for a message list (chars / 4 over the
+/// string contents) — enough for the context-overflow check,
+/// which only needs to know "clearly over", not an exact count.
+fn estimate_tokens(messages: &[serde_json::Value]) -> u64 {
+    let mut chars: u64 = 0;
+    for message in messages {
+        match message.get("content") {
+            Some(serde_json::Value::String(text)) => {
+                chars += text.chars().count() as u64;
+            }
+            Some(serde_json::Value::Array(parts)) => {
+                for part in parts {
+                    if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
+                        chars += text.chars().count() as u64;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    chars / 4
+}
+
+/// Merge a model's stored inference defaults into a chat request
+/// body, in place. Only fields the request itself leaves unset
+/// are filled — a client's explicit values always win. Returns
+/// true when anything changed (callers then re-serialize instead
+/// of forwarding the raw body).
+fn apply_inference_defaults(
+    body: &mut serde_json::Value,
+    cfg: &InferenceConfig,
+    instance_context: Option<u32>,
+) -> bool {
+    if cfg.is_empty() {
+        return false;
+    }
+    let Some(obj) = body.as_object_mut() else {
+        return false;
+    };
+    fn fill(
+        obj: &mut serde_json::Map<String, serde_json::Value>,
+        key: &str,
+        value: Option<serde_json::Value>,
+    ) -> bool {
+        match value {
+            Some(value) if !obj.contains_key(key) => {
+                obj.insert(key.to_string(), value);
+                true
+            }
+            _ => false,
+        }
+    }
+    let mut changed = false;
+    changed |= fill(obj, "temperature", cfg.temperature.map(|v| serde_json::json!(v)));
+    changed |= fill(
+        obj,
+        "top_p",
+        cfg.top_p
+            .filter(|_| cfg.top_p_enabled != Some(false))
+            .map(|v| serde_json::json!(v)),
+    );
+    changed |= fill(obj, "top_k", cfg.top_k.map(|v| serde_json::json!(v)));
+    changed |= fill(
+        obj,
+        "min_p",
+        cfg.min_p
+            .filter(|_| cfg.min_p_enabled != Some(false))
+            .map(|v| serde_json::json!(v)),
+    );
+    changed |= fill(
+        obj,
+        "repeat_penalty",
+        cfg.repeat_penalty
+            .filter(|_| cfg.repeat_penalty_enabled == Some(true))
+            .map(|v| serde_json::json!(v)),
+    );
+    changed |= fill(
+        obj,
+        "presence_penalty",
+        cfg.presence_penalty
+            .filter(|_| cfg.presence_penalty_enabled == Some(true))
+            .map(|v| serde_json::json!(v)),
+    );
+    if cfg.limit_response_length == Some(true) {
+        changed |= fill(
+            obj,
+            "max_tokens",
+            cfg.max_response_tokens.map(|v| serde_json::json!(v)),
+        );
+    }
+    if !cfg.stop_strings.is_empty() {
+        changed |= fill(obj, "stop", Some(serde_json::json!(cfg.stop_strings)));
+    }
+    if cfg.structured_output == Some(true) {
+        changed |= fill(
+            obj,
+            "response_format",
+            Some(serde_json::json!({ "type": "json_object" })),
+        );
+    }
+
+    // Message-level fills: the stored system prompt (only when
+    // the conversation carries no system message of its own) and
+    // Truncate-Middle context overflow.
+    let prompt = cfg
+        .system_prompt
+        .as_deref()
+        .filter(|p| !p.trim().is_empty());
+    let truncate = cfg.context_overflow.as_deref() == Some("truncate_middle");
+    if prompt.is_some() || truncate {
+        if let Some(messages) = obj.get_mut("messages").and_then(|m| m.as_array_mut()) {
+            if let Some(prompt) = prompt {
+                let has_system = messages
+                    .iter()
+                    .any(|m| m.get("role").and_then(|r| r.as_str()) == Some("system"));
+                if !has_system {
+                    messages.insert(
+                        0,
+                        serde_json::json!({ "role": "system", "content": prompt }),
+                    );
+                    changed = true;
+                }
+            }
+            if truncate {
+                if let Some(limit) = instance_context {
+                    // Drop middle non-system messages (never the
+                    // last one — the current turn) until the
+                    // estimate fits. System messages stay.
+                    let mut guard = 0;
+                    while estimate_tokens(messages) > limit as u64 && guard < 512 {
+                        guard += 1;
+                        let droppable: Vec<usize> = messages
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, m)| {
+                                m.get("role").and_then(|r| r.as_str()) != Some("system")
+                            })
+                            .map(|(i, _)| i)
+                            .collect();
+                        if droppable.len() <= 2 {
+                            break;
+                        }
+                        // The middle of the droppable range,
+                        // never its final element.
+                        let victim = droppable[(droppable.len() - 1) / 2];
+                        messages.remove(victim);
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+    changed
 }
 
 async fn chat_completions(State(state): State<Arc<AppState>>, body: axum::body::Bytes) -> Response {
@@ -1926,13 +2664,21 @@ async fn chat_completions(State(state): State<Arc<AppState>>, body: axum::body::
         .and_then(|v| v.as_str())
         .map(str::to_owned);
 
-    // The proxy target: (base_url, model-id rewrite, engine API
-    // key). Local instances forward the body untouched (rewrite
-    // `None`); a Maya target rewrites `model` to the provider's
-    // own id, since the client named our `maya/<provider>/<id>`
-    // key. The API key is the instance's per-load Bearer token
-    // (Splash pack), `None` for keyless engines and Maya.
-    let mut target: Option<(String, Option<String>, Option<String>)> = None;
+    // The proxy target. Local instances forward the body
+    // untouched (rewrite `None`); a Maya target rewrites `model`
+    // to the provider's own id, since the client named our
+    // `maya/<provider>/<id>` key. The API key is the instance's
+    // per-load Bearer token (Splash pack), `None` for keyless
+    // engines and Maya. `config_key` + `context_length` feed the
+    // per-model inference-defaults merge below.
+    struct ChatTarget {
+        base_url: String,
+        rewrite: Option<String>,
+        api_key: Option<String>,
+        config_key: Option<String>,
+        context_length: Option<u32>,
+    }
+    let mut target: Option<ChatTarget> = None;
 
     // 1. A loaded local instance: exact model match (full key or
     //    bare name).
@@ -1945,7 +2691,13 @@ async fn chat_completions(State(state): State<Arc<AppState>>, body: axum::body::
                     loaded.instance.model_key == *model
                         || loaded.instance.model_key.rsplit('/').next() == Some(model.as_str())
                 })
-                .map(|loaded| (loaded.base_url.clone(), None, loaded.api_key.clone()));
+                .map(|loaded| ChatTarget {
+                    base_url: loaded.base_url.clone(),
+                    rewrite: None,
+                    api_key: loaded.api_key.clone(),
+                    config_key: Some(loaded.instance.model_key.clone()),
+                    context_length: loaded.context_length,
+                });
         }
     }
 
@@ -1955,8 +2707,14 @@ async fn chat_completions(State(state): State<Arc<AppState>>, body: axum::body::
     //    whose provider is offline or does not serve it.
     if target.is_none() {
         if let Some(model) = &requested {
-            if let Some((base_url, model_id)) = resolve_maya_target(&state, model).await {
-                target = Some((base_url, Some(model_id), None));
+            if let Some((base_url, model_id, key)) = resolve_maya_target(&state, model).await {
+                target = Some(ChatTarget {
+                    base_url,
+                    rewrite: Some(model_id),
+                    api_key: None,
+                    config_key: Some(key),
+                    context_length: None,
+                });
             } else if model.starts_with("maya/") {
                 return error_response(
                     StatusCode::BAD_GATEWAY,
@@ -1972,10 +2730,13 @@ async fn chat_completions(State(state): State<Arc<AppState>>, body: axum::body::
     if target.is_none() {
         let instances = state.instances.read().await;
         if instances.len() == 1 {
-            target = instances
-                .values()
-                .next()
-                .map(|loaded| (loaded.base_url.clone(), None, loaded.api_key.clone()));
+            target = instances.values().next().map(|loaded| ChatTarget {
+                base_url: loaded.base_url.clone(),
+                rewrite: None,
+                api_key: loaded.api_key.clone(),
+                config_key: Some(loaded.instance.model_key.clone()),
+                context_length: loaded.context_length,
+            });
         }
     }
 
@@ -1995,19 +2756,20 @@ async fn chat_completions(State(state): State<Arc<AppState>>, body: axum::body::
                 );
             }
             if let Some(entry) = resolve_model(&state, model) {
-                match spawn_instance(&state, &entry, None, None, LoadKnobs::default()).await {
+                // JIT loads use the model's stored load config —
+                // the same config an explicit Library load uses.
+                let config = effective_load_config(&state, &entry.key, None).await;
+                match spawn_instance(&state, &entry, &config).await {
                     Ok(instance) => {
-                        let api_key = state
-                            .instances
-                            .read()
-                            .await
-                            .get(&instance.instance_id)
-                            .and_then(|loaded| loaded.api_key.clone());
-                        target = Some((
-                            format!("http://127.0.0.1:{}", instance.port),
-                            None,
-                            api_key,
-                        ))
+                        let loaded = state.instances.read().await;
+                        let loaded = loaded.get(&instance.instance_id);
+                        target = Some(ChatTarget {
+                            base_url: format!("http://127.0.0.1:{}", instance.port),
+                            rewrite: None,
+                            api_key: loaded.and_then(|l| l.api_key.clone()),
+                            config_key: Some(entry.key.clone()),
+                            context_length: loaded.and_then(|l| l.context_length),
+                        })
                     }
                     Err((status, body)) => return (status, Json(body)).into_response(),
                 }
@@ -2015,12 +2777,19 @@ async fn chat_completions(State(state): State<Arc<AppState>>, body: axum::body::
         }
     }
 
-    let Some((base_url, rewrite, api_key)) = target else {
+    let Some(target) = target else {
         return error_response(
             StatusCode::BAD_REQUEST,
             "no loaded instance matches the requested model; load a model first",
         );
     };
+    let ChatTarget {
+        base_url,
+        rewrite,
+        api_key,
+        config_key,
+        context_length,
+    } = target;
     log_line(
         &state,
         format!(
@@ -2031,12 +2800,31 @@ async fn chat_completions(State(state): State<Arc<AppState>>, body: axum::body::
     )
     .await;
 
+    // Per-model inference defaults: fill whatever the request
+    // leaves unset (temperature, sampling, stop strings, system
+    // prompt, structured output, context overflow). When nothing
+    // is filled and no rewrite is needed, the raw body forwards
+    // byte-for-byte, exactly as before.
+    let inference = match &config_key {
+        Some(key) => state
+            .model_configs
+            .read()
+            .await
+            .get(key)
+            .map(|config| config.inference.clone()),
+        None => None,
+    };
+    let mut value = parsed.clone();
+    let mut merged = false;
+    if let Some(inference) = &inference {
+        merged = apply_inference_defaults(&mut value, inference, context_length);
+    }
     let out_body: Vec<u8> = match &rewrite {
         Some(model_id) => {
-            let mut value = parsed.clone();
             value["model"] = serde_json::Value::String(model_id.clone());
             serde_json::to_vec(&value).unwrap_or_else(|_| body.to_vec())
         }
+        None if merged => serde_json::to_vec(&value).unwrap_or_else(|_| body.to_vec()),
         None => body.to_vec(),
     };
 
@@ -2136,6 +2924,7 @@ async fn main() {
     let settings_dir = settings_dir();
     let (maya_providers, maya_source) = resolve_maya_providers(&settings_dir);
     let persisted = resolve_persisted(&settings_dir);
+    let model_configs = read_model_configs(&settings_dir);
 
     let state = Arc::new(AppState {
         port,
@@ -2152,6 +2941,7 @@ async fn main() {
         downloads: RwLock::new(HashMap::new()),
         logs: RwLock::new(VecDeque::new()),
         persisted: RwLock::new(persisted),
+        model_configs: RwLock::new(model_configs),
     });
     let app = Router::new()
         .route("/api/v1/models", get(list_models))
@@ -2159,6 +2949,12 @@ async fn main() {
         .route("/api/v1/logs", get(get_logs))
         .route("/api/v1/models/load", post(load_model))
         .route("/api/v1/models/unload", post(unload_model))
+        .route(
+            "/api/v1/model-configs",
+            get(get_model_configs).post(update_model_config),
+        )
+        .route("/api/v1/models/reveal", post(reveal_path))
+        .route("/api/v1/models/delete", post(delete_model))
         .route("/api/v1/discover/search", get(discover_search))
         .route("/api/v1/discover/files", get(discover_files))
         .route("/api/v1/models/download", post(start_download))

@@ -275,6 +275,18 @@ fn scan_model_dir(publisher: &str, name: &str, dir: &Path) -> Option<ModelEntry>
         return Some(entry);
     }
 
+    // Nothing loadable, but the folder carries a scanner warning
+    // (an unfinished `.part` download): list it flagged rather
+    // than hiding it, so Show warnings can surface it.
+    if !shared_warnings.is_empty() {
+        let mut entry = base(ModelFormat::Gguf);
+        entry.warnings = shared_warnings;
+        entry.file_name = files
+            .first()
+            .and_then(|(p, _)| p.file_name().map(|n| n.to_string_lossy().into_owned()));
+        return Some(entry);
+    }
+
     None
 }
 

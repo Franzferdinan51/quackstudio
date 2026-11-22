@@ -293,6 +293,7 @@ fn mlx_max_context(config: &serde_json::Value) -> Option<u32> {
 /// Quantization tokens as they appear in GGUF file names and MLX
 /// directory names, longest first so `Q4_K_M` wins over `Q4_0`.
 const QUANT_TOKENS: &[&str] = &[
+    "Q4_K_XL", "Q5_K_XL", "Q3_K_XL", "Q6_K_XL", "Q2_K_XL",
     "Q4_K_M", "Q4_K_S", "Q5_K_M", "Q5_K_S", "Q3_K_M", "Q3_K_L", "Q3_K_S", "Q6_K",
     "Q2_K", "Q8_0", "Q5_0", "Q5_1", "Q4_0", "Q4_1", "IQ4_XS", "IQ4_NL", "IQ3_S",
     "IQ2_XXS", "IQ2_XS", "IQ2_S", "IQ1_S", "IQ1_M", "BF16", "F16", "F32",

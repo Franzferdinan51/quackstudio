@@ -28,6 +28,29 @@ export interface MayaProvider {
   base_url: string;
 }
 
+/** Server behaviour knobs (settings.json `server`). Only `jit`
+ *  is enforced by quackd today; the rest are stored preferences. */
+export interface ServerSettings {
+  require_auth: boolean;
+  serve_lan: boolean;
+  cors: boolean;
+  jit: boolean;
+  jit_ttl_minutes: number;
+  jit_only_last: boolean;
+}
+
+/** settings.json `general`. */
+export interface GeneralSettings {
+  hf_proxy: boolean;
+}
+
+/** settings.json `defaults`. `context_length` seeds the Library
+ *  Load tab; `image_max_px` is stored only. */
+export interface ModelDefaults {
+  context_length: number | null;
+  image_max_px: number | null;
+}
+
 /** GET /api/v1/settings. POST returns the same shape, plus an
  *  optional `note` (e.g. when the env var overrides the file). */
 export interface SettingsView {
@@ -37,7 +60,47 @@ export interface SettingsView {
   backends_dir: string;
   maya_providers: MayaProvider[];
   maya_providers_source: "env" | "settings" | "default";
+  server: ServerSettings;
+  general: GeneralSettings;
+  defaults: ModelDefaults;
   note?: string;
+}
+
+/** One loaded instance as reported in GET /api/v1/status. */
+export interface StatusInstance {
+  instance_id: string;
+  model_key: string;
+  backend: string;
+  port: number;
+  pid: number;
+  context_length: number | null;
+  size_bytes: number;
+}
+
+/** GET /api/v1/status. */
+export interface StatusView {
+  version: string;
+  port: number;
+  models_dir: string;
+  backends_dir: string;
+  model_count: number;
+  loaded_instances: number;
+  instances: StatusInstance[];
+  maya_providers: number;
+  maya_providers_online: number;
+  host: {
+    name: string;
+    chip: string;
+    gpu: string;
+    total_ram_bytes: number;
+    /** Sum of loaded models' on-disk sizes — the loaded-weights
+     *  proxy shown in the sidebar RAM pill. */
+    loaded_bytes: number;
+    /** quackd's own peak RSS (getrusage) — the second pill. */
+    daemon_rss_bytes: number;
+    cpu_percent: number | null;
+  };
+  packs: { llama: string; mlx: string; splash: string };
 }
 
 /** One Hugging Face search result (GET /api/v1/discover/search). */
@@ -68,3 +131,11 @@ export interface DownloadJob {
 export function formatGB(bytes: number): string {
   return `${(bytes / 1_000_000_000).toFixed(2)} GB`;
 }
+
+/** Library sidebar categories. "all" is My Models / View All. */
+export type LibraryCategory =
+  | "all"
+  | "llms"
+  | "embedding"
+  | "decision"
+  | "drafters";

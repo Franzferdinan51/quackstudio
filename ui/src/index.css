@@ -14,6 +14,17 @@
   --color-ok: #34c759;
 }
 
+/* Light palette (Settings → Appearance → Color Theme: Light).
+   Basic but complete: every surface reads the theme vars. */
+:root.light {
+  --color-app-bg: #f2f2f4;
+  --color-panel: #ffffff;
+  --color-panel-2: #e9e9ee;
+  --color-edge: #d5d5dc;
+  --color-ink: #1b1b1d;
+  --color-muted: #6d6d78;
+}
+
 html,
 body,
 #root {

@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useState } from "react";
 import { Check, Loader2, MessageSquare, Search, Upload, X } from "lucide-react";
-import type { ModelEntry } from "../types";
+import type { LibraryCategory, ModelEntry } from "../types";
 import { formatGB } from "../types";
 import { apiBase } from "../api";
+import type { InferenceDefaults } from "../store";
+import { loadInference, saveInference } from "../store";
 
 /** Shown (clearly labeled) only when quackd is unreachable. */
 const SAMPLE_ROWS: ModelEntry[] = [
@@ -64,19 +66,69 @@ const SAMPLE_ROWS: ModelEntry[] = [
   },
 ];
 
-type DetailTab = "info" | "load";
+type DetailTab = "info" | "load" | "inference";
 type LoadMessage = { kind: "ok" | "error"; text: string };
 
-/** Library (My Models): filter bar + model table fed by quackd,
- *  with a detail panel (Info / Load) for the selected model. */
-export default function Library() {
+interface LoadAdvanced {
+  nThreads: string;
+  evalBatch: string;
+  physBatch: string;
+}
+
+const ADV_KEY = (key: string) => `quack.loadAdv.${key}`;
+
+function loadAdvanced(key: string): LoadAdvanced {
+  try {
+    const raw = localStorage.getItem(ADV_KEY(key));
+    if (raw) return JSON.parse(raw) as LoadAdvanced;
+  } catch {
+    // fall through to blanks
+  }
+  return { nThreads: "", evalBatch: "", physBatch: "" };
+}
+
+/** Category membership, from the fields the scanner gives us.
+ *  Approximations (no type field exists on ModelEntry):
+ *  embedding = name mentions nomic/embed; tokenizer/audio
+ *  (speech_tokenizer) is neither an LLM nor an embedding;
+ *  decision = d1-/decision in the key; drafters = draft in name. */
+function inCategory(m: ModelEntry, category: LibraryCategory): boolean {
+  const name = `${m.key} ${m.display_name}`.toLowerCase();
+  const isEmbedding = name.includes("nomic") || name.includes("embed");
+  const isTokenizer = name.includes("tokenizer");
+  switch (category) {
+    case "all":
+      return true;
+    case "llms":
+      return !isEmbedding && !isTokenizer;
+    case "embedding":
+      return isEmbedding;
+    case "decision":
+      return name.includes("d1-") || name.includes("decision");
+    case "drafters":
+      return name.includes("drafter") || name.includes("draft");
+  }
+}
+
+/** Library (My Models): category-filtered model table fed by
+ *  quackd, footer totals, and a detail panel (Info / Load /
+ *  Inference) for the selected model. */
+export default function Library({ category }: { category: LibraryCategory }) {
   const [models, setModels] = useState<ModelEntry[]>([]);
   const [offline, setOffline] = useState(false);
   const [filter, setFilter] = useState("");
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
   const [tab, setTab] = useState<DetailTab>("info");
   const [ctxLength, setCtxLength] = useState(8192);
+  const [defaultCtx, setDefaultCtx] = useState(8192);
+  const [modelsDir, setModelsDir] = useState("");
   const [gpuLayers, setGpuLayers] = useState(99);
+  const [advanced, setAdvanced] = useState<LoadAdvanced>({
+    nThreads: "",
+    evalBatch: "",
+    physBatch: "",
+  });
+  const [inference, setInference] = useState<InferenceDefaults | null>(null);
   const [loadBusy, setLoadBusy] = useState(false);
   const [loadMsg, setLoadMsg] = useState<LoadMessage | null>(null);
   const [unloadingId, setUnloadingId] = useState<string | null>(null);
@@ -98,23 +150,69 @@ export default function Library() {
     void fetchModels();
   }, [fetchModels]);
 
-  // Fresh selection → back to Info, default load config, no stale
-  // load result.
+  // Settings defaults: the Load tab's initial context length and
+  // the footer models-dir path.
   useEffect(() => {
-    setTab("info");
-    setCtxLength(8192);
+    void (async () => {
+      try {
+        const base = await apiBase();
+        const res = await fetch(`${base}/api/v1/settings`);
+        if (!res.ok) return;
+        const view = (await res.json()) as {
+          models_dir: string;
+          defaults?: { context_length: number | null };
+        };
+        setModelsDir(view.models_dir);
+        if (view.defaults?.context_length) {
+          setDefaultCtx(view.defaults.context_length);
+          setCtxLength(view.defaults.context_length);
+        }
+      } catch {
+        // Defaults are best-effort.
+      }
+    })();
+  }, []);
+
+  // Downloads pane / model picker "Load Model" handoff: a model
+  // key in sessionStorage + this event (or already set at mount).
+  const adoptLoadHandoff = useCallback(() => {
+    const pending = sessionStorage.getItem("quack.loadModel");
+    if (pending) {
+      sessionStorage.removeItem("quack.loadModel");
+      setSelectedKey(pending);
+      setTab("load");
+    }
+  }, []);
+  useEffect(() => {
+    adoptLoadHandoff();
+    window.addEventListener("quack:open-load", adoptLoadHandoff);
+    return () =>
+      window.removeEventListener("quack:open-load", adoptLoadHandoff);
+  }, [adoptLoadHandoff]);
+
+  // Fresh selection → back to Info (unless a load handoff just
+  // chose the Load tab), default load config, no stale result.
+  useEffect(() => {
+    setCtxLength(defaultCtx);
     setGpuLayers(99);
     setLoadMsg(null);
-  }, [selectedKey]);
+    if (selectedKey) {
+      setAdvanced(loadAdvanced(selectedKey));
+      setInference(loadInference(selectedKey));
+    }
+  }, [selectedKey, defaultCtx]);
 
   const rows = offline ? SAMPLE_ROWS : models;
   const needle = filter.trim().toLowerCase();
   const visible = rows.filter(
     (m) =>
-      needle === "" ||
-      `${m.publisher}/${m.display_name}`.toLowerCase().includes(needle),
+      inCategory(m, category) &&
+      (needle === "" ||
+        `${m.publisher}/${m.display_name}`.toLowerCase().includes(needle)),
   );
   const selected = rows.find((m) => m.key === selectedKey) ?? null;
+  const localRows = rows.filter((m) => m.format !== "maya");
+  const totalBytes = localRows.reduce((sum, m) => sum + m.size_bytes, 0);
 
   async function loadSelected() {
     if (!selected || loadBusy) return;
@@ -122,14 +220,23 @@ export default function Library() {
     setLoadMsg(null);
     try {
       const base = await apiBase();
+      const body: Record<string, unknown> = {
+        model: selected.key,
+        context_length: ctxLength,
+        gpu_offload: gpuLayers,
+      };
+      // Advanced knobs: forwarded to llama-server as -t/-b/-ub by
+      // quackd for GGUF loads; stored-but-ignored for MLX.
+      const nThreads = parseInt(advanced.nThreads, 10);
+      const evalBatch = parseInt(advanced.evalBatch, 10);
+      const physBatch = parseInt(advanced.physBatch, 10);
+      if (Number.isFinite(nThreads)) body.n_threads = nThreads;
+      if (Number.isFinite(evalBatch)) body.eval_batch_size = evalBatch;
+      if (Number.isFinite(physBatch)) body.physical_batch_size = physBatch;
       const res = await fetch(`${base}/api/v1/models/load`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          model: selected.key,
-          context_length: ctxLength,
-          gpu_offload: gpuLayers,
-        }),
+        body: JSON.stringify(body),
       });
       const data: unknown = await res.json().catch(() => null);
       if (!res.ok) {
@@ -199,6 +306,25 @@ export default function Library() {
     window.dispatchEvent(new Event("quack:use-in-chat"));
   }
 
+  function updateAdvanced(patch: Partial<LoadAdvanced>) {
+    const next = { ...advanced, ...patch };
+    setAdvanced(next);
+    if (selectedKey) {
+      try {
+        localStorage.setItem(ADV_KEY(selectedKey), JSON.stringify(next));
+      } catch {
+        // best-effort
+      }
+    }
+  }
+
+  function updateInference(patch: Partial<InferenceDefaults>) {
+    if (!inference || !selectedKey) return;
+    const next = { ...inference, ...patch };
+    setInference(next);
+    saveInference(selectedKey, next);
+  }
+
   return (
     <div className="flex h-full">
       {/* List column */}
@@ -242,7 +368,10 @@ export default function Library() {
               {visible.map((m) => (
                 <tr
                   key={m.key}
-                  onClick={() => setSelectedKey(m.key)}
+                  onClick={() => {
+                    setSelectedKey(m.key);
+                    setTab("info");
+                  }}
                   className={`cursor-pointer border-b border-edge/50 transition-colors last:border-0 hover:bg-panel ${
                     m.key === selectedKey ? "bg-panel-2" : ""
                   }`}
@@ -292,13 +421,26 @@ export default function Library() {
               {visible.length === 0 && !offline && (
                 <tr>
                   <td colSpan={7} className="px-4 py-10 text-center text-muted">
-                    No models found. Download one from Discover.
+                    No models in this category. Download one from Model
+                    Search.
                   </td>
                 </tr>
               )}
             </tbody>
           </table>
         </div>
+
+        {/* Footer totals */}
+        <p className="pt-3 text-[12px] text-muted">
+          You have {localRows.length} local models, taking up{" "}
+          {formatGB(totalBytes)} of disk space
+          {modelsDir && (
+            <>
+              {" · "}
+              <span className="font-mono text-[11px]">{modelsDir}</span>
+            </>
+          )}
+        </p>
       </div>
 
       {/* Detail panel */}
@@ -355,6 +497,7 @@ export default function Library() {
               [
                 ["info", "Info"],
                 ["load", "Load"],
+                ["inference", "Inference"],
               ] as [DetailTab, string][]
             ).map(([value, label]) => (
               <button
@@ -408,6 +551,62 @@ export default function Library() {
                 </div>
               )}
             </dl>
+          )}
+
+          {tab === "inference" && inference && (
+            <div className="mt-4 flex flex-col gap-4">
+              <p className="text-[12px] text-muted">
+                Defaults for fresh chats with this model (stored
+                locally). Temperature and Top P seed the Chat
+                Configuration panel; the rest are recorded for when
+                the engines accept them.
+              </p>
+              {(
+                [
+                  ["temperature", "Temperature", 0, 2, 0.05],
+                  ["topP", "Top P", 0, 1, 0.05],
+                  ["topK", "Top K", 0, 200, 1],
+                  ["minP", "Min P", 0, 1, 0.01],
+                  ["repeatPenalty", "Repeat Penalty", 0.5, 2, 0.05],
+                ] as [
+                  keyof InferenceDefaults,
+                  string,
+                  number,
+                  number,
+                  number,
+                ][]
+              ).map(([field, label, min, max, step]) => (
+                <div key={field}>
+                  <div className="flex items-center justify-between">
+                    <label className="text-[13px] text-muted">{label}</label>
+                    <input
+                      type="number"
+                      min={min}
+                      max={max}
+                      step={step}
+                      value={inference[field]}
+                      onChange={(e) =>
+                        updateInference({
+                          [field]: Number(e.target.value) || 0,
+                        })
+                      }
+                      className="w-24 rounded-lg border border-edge bg-panel-2 px-2 py-1 text-right text-[13px] outline-none"
+                    />
+                  </div>
+                  <input
+                    type="range"
+                    min={min}
+                    max={max}
+                    step={step}
+                    value={inference[field]}
+                    onChange={(e) =>
+                      updateInference({ [field]: Number(e.target.value) })
+                    }
+                    className="mt-2 w-full accent-accent"
+                  />
+                </div>
+              ))}
+            </div>
           )}
 
           {tab === "load" && selected.format === "maya" && (
@@ -485,8 +684,8 @@ export default function Library() {
                 />
                 {selected.format !== "gguf" && (
                   <p className="mt-1 text-[11px] text-muted">
-                    Context length is passed to llama.cpp only in P2; the
-                    MLX server uses its own default.
+                    Context length is passed to llama.cpp only; the MLX
+                    server uses its own default.
                   </p>
                 )}
               </div>
@@ -518,6 +717,40 @@ export default function Library() {
                     only.
                   </p>
                 )}
+              </div>
+
+              {/* Advanced (llama.cpp flags -t / -b / -ub) */}
+              <div className="rounded-xl border border-edge px-3.5 py-3">
+                <p className="text-[13px] font-medium">Advanced</p>
+                {(
+                  [
+                    ["nThreads", "CPU Thread Pool Size"],
+                    ["evalBatch", "Evaluation Batch Size"],
+                    ["physBatch", "Physical Batch Size"],
+                  ] as [keyof LoadAdvanced, string][]
+                ).map(([field, label]) => (
+                  <div
+                    key={field}
+                    className="mt-2.5 flex items-center justify-between gap-3"
+                  >
+                    <label className="text-[13px] text-muted">{label}</label>
+                    <input
+                      type="number"
+                      min={1}
+                      placeholder="engine default"
+                      value={advanced[field]}
+                      onChange={(e) =>
+                        updateAdvanced({ [field]: e.target.value })
+                      }
+                      className="w-28 rounded-lg border border-edge bg-panel-2 px-2 py-1 text-right text-[13px] outline-none placeholder:text-[11px] placeholder:text-muted"
+                    />
+                  </div>
+                ))}
+                <p className="mt-2.5 text-[11px] text-muted">
+                  {selected.format === "gguf"
+                    ? "Forwarded to llama-server (-t / -b / -ub) when set."
+                    : "MLX: not applied — mlx_vlm.server has no equivalents; values are stored per model."}
+                </p>
               </div>
 
               {selected.format === "splash" && (

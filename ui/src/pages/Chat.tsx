@@ -27,6 +27,7 @@ import {
   savePrefs,
 } from "../store";
 import Toggle from "../components/Toggle";
+import { syncModelConfigs } from "../modelConfigs";
 
 type LoadPhase = "none" | "loading" | "ready" | "error";
 type PanelTab = "integrations" | "configuration";
@@ -115,6 +116,9 @@ export default function Chat({
   // already-loaded instance for the active chat.
   useEffect(() => {
     let cancelled = false;
+    // Refresh the per-model inference mirror from quackd's
+    // config store, so selectModel seeds from current defaults.
+    void syncModelConfigs();
     void (async () => {
       const base = await apiBase();
       fetch(`${base}/api/v1/models`)
@@ -190,6 +194,7 @@ export default function Chat({
       const inf = loadInference(model.key);
       patch.temperature = inf.temperature;
       patch.topP = inf.topP;
+      if (inf.systemPrompt) patch.systemPrompt = inf.systemPrompt;
     }
     updateChat(patch);
     if (manualParams) {

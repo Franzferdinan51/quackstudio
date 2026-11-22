@@ -17,9 +17,84 @@ export interface ModelEntry {
   path: string;
   arch: string | null;
   vision: boolean;
+  /** Name of the main payload file (main GGUF, largest safetensors…). */
+  file_name: string | null;
+  /** Quantization label when the scanner could derive one. */
+  quantization: string | null;
+  /** Context ceiling from the model's own metadata. */
+  max_context: number | null;
+  /** Serving domain: "llm" | "embedding". */
+  domain: string;
+  /** Scanner flags (incomplete download, missing payload, …). */
+  warnings: string[];
   /** Base URL of the serving provider for remote (Maya) models; null locally. */
   remote_url: string | null;
   loaded_instances: LoadedInstance[];
+}
+
+/** Per-model load config — the daemon's `model-configs.json`
+ *  `load` section and the load request's flattened fields. Every
+ *  field optional; absent = engine default / not customized.
+ *  Flag mappings live in quackd (verified vs llama-server
+ *  2.80.1); num_experts / num_layers_offload / moe_expert are
+ *  stored-only. */
+export interface LoadConfigWire {
+  context_length?: number;
+  gpu_offload?: number;
+  cpu_threads?: number;
+  eval_batch_size?: number;
+  physical_batch_size?: number;
+  max_concurrent?: number;
+  unified_kv_cache?: boolean;
+  context_checkpoints?: number;
+  reasoning_budget_message?: string;
+  rope_freq_base?: number;
+  rope_freq_scale?: number;
+  kv_offload?: boolean;
+  keep_in_memory?: boolean;
+  try_mmap?: boolean;
+  on_demand_tensor_loading?: string;
+  seed?: number;
+  num_experts?: number;
+  num_layers_offload?: number;
+  moe_expert?: number;
+  speculative_decoding?: string;
+  chat_template?: string;
+  flash_attention?: boolean;
+  cache_type_k?: string;
+  cache_type_v?: string;
+  args_override?: string;
+}
+
+/** Per-model inference defaults — the daemon's `inference`
+ *  section. The chat proxy fills request fields the client left
+ *  unset from these. */
+export interface InferenceConfigWire {
+  system_prompt?: string;
+  reasoning_budget_enabled?: boolean;
+  reasoning_budget?: number;
+  temperature?: number;
+  limit_response_length?: boolean;
+  max_response_tokens?: number;
+  context_overflow?: string;
+  stop_strings?: string[];
+  top_k?: number;
+  repeat_penalty_enabled?: boolean;
+  repeat_penalty?: number;
+  presence_penalty_enabled?: boolean;
+  presence_penalty?: number;
+  top_p_enabled?: boolean;
+  top_p?: number;
+  min_p_enabled?: boolean;
+  min_p?: number;
+  structured_output?: boolean;
+}
+
+/** One model's persisted config (GET/POST /api/v1/model-configs). */
+export interface ModelConfigWire {
+  load: LoadConfigWire;
+  inference: InferenceConfigWire;
+  pinned: boolean;
 }
 
 /** A Maya provider entry (quack-core's MayaProvider). */

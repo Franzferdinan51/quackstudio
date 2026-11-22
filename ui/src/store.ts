@@ -165,6 +165,10 @@ export interface InferenceDefaults {
   topK: number;
   minP: number;
   repeatPenalty: number;
+  /** The model's stored default system prompt (Library →
+   *  Inference); seeds fresh chats with the model. */
+  systemPrompt: string;
+  presencePenalty: number;
 }
 
 export const INFERENCE_FALLBACK: InferenceDefaults = {
@@ -173,6 +177,8 @@ export const INFERENCE_FALLBACK: InferenceDefaults = {
   topK: 40,
   minP: 0.05,
   repeatPenalty: 1.1,
+  systemPrompt: "",
+  presencePenalty: 0,
 };
 
 export function loadInference(modelKey: string): InferenceDefaults {

@@ -13,12 +13,15 @@ use std::path::{Path, PathBuf};
 // Model library
 // ---------------------------------------------------------------------------
 
-/// On-disk model format, as QuackStudio understands it in P0.
+/// On-disk model format, as QuackStudio understands it.
+/// Mirrors Duckets' backend preferences: GGUF → llama.cpp,
+/// safetensors (MLX) → oMLX, Splash → the Splash/Strata pack (P3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ModelFormat {
     Gguf,
     Mlx,
+    Splash,
 }
 
 /// One downloaded model in the library.
@@ -50,6 +53,10 @@ pub struct ModelEntry {
 /// - A model dir with a top-level `config.json` plus `*.safetensors`
 ///   files is an MLX model; `arch` comes from `config.json`
 ///   `"architectures"[0]` when parseable.
+/// - A model dir with a top-level `manifest.json` plus a `target/`
+///   subdirectory is a Splash model (the Splash engine's package
+///   layout: `manifest.json` + `target/` + `draft/`); `vision` is
+///   set when a `vision/` subdirectory exists.
 /// - Anything else is skipped, as are hidden directories at either
 ///   level.
 ///
@@ -102,6 +109,22 @@ fn scan_model_dir(publisher: &str, name: &str, dir: &Path) -> Option<ModelEntry>
             .map(|n| n.to_string_lossy().to_lowercase())
             .unwrap_or_default()
     };
+
+    // Splash: manifest.json + target/ payload directory. Checked
+    // first: a Splash package's payload may itself contain weight
+    // files that would otherwise trip the GGUF/MLX rules.
+    if dir.join("manifest.json").is_file() && dir.join("target").is_dir() {
+        return Some(ModelEntry {
+            key: format!("{publisher}/{name}"),
+            publisher: publisher.to_string(),
+            display_name: name.to_string(),
+            format: ModelFormat::Splash,
+            size_bytes,
+            path: dir.to_path_buf(),
+            arch: None,
+            vision: dir.join("vision").is_dir(),
+        });
+    }
 
     // GGUF: needs a main file (largest .gguf that is not an mmproj).
     let ggufs: Vec<&(PathBuf, u64)> = files
@@ -218,6 +241,14 @@ impl LoadConfig {
                 num_experts: None,
             },
             ModelFormat::Mlx => LoadConfig {
+                context_length: Some(4096),
+                gpu_offload: None,
+                eval_batch_size: None,
+                physical_batch_size: None,
+                flash_attention: None,
+                num_experts: None,
+            },
+            ModelFormat::Splash => LoadConfig {
                 context_length: Some(4096),
                 gpu_offload: None,
                 eval_batch_size: None,
@@ -366,6 +397,40 @@ pub fn find_llama_server(backends_dir: &Path) -> Option<PathBuf> {
 }
 
 // ---------------------------------------------------------------------------
+// oMLX pack discovery
+// ---------------------------------------------------------------------------
+
+/// Find the Python interpreter of the newest oMLX (LM Studio's
+/// selected MLX backend) install under `backends_dir`. oMLX builds
+/// live under `vendor/_amphibian/` as `app-omlx-mac26-arm64@<N>`
+/// directories (several builds side by side); the highest build
+/// number with a `bin/python` wins. That interpreter imports
+/// `mlx_vlm`, which is what quackd serves MLX models with.
+/// `None` when no oMLX build is installed.
+pub fn find_omlx_python(backends_dir: &Path) -> Option<PathBuf> {
+    let amphibian = backends_dir.join("vendor").join("_amphibian");
+    let read_dir = fs::read_dir(&amphibian).ok()?;
+    let mut best: Option<(u64, PathBuf)> = None;
+    for entry in read_dir.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(build) = name.strip_prefix("app-omlx-mac26-arm64@") else {
+            continue;
+        };
+        let Ok(build) = build.parse::<u64>() else {
+            continue;
+        };
+        let python = entry.path().join("bin").join("python");
+        if !python.is_file() {
+            continue;
+        }
+        if best.as_ref().map_or(true, |(b, _)| build > *b) {
+            best = Some((build, python));
+        }
+    }
+    best.map(|(_, path)| path)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -382,6 +447,7 @@ mod tests {
     /// Fixture tree:
     ///   models/lmstudio-community/Test-GGUF/{test-q4_k_m.gguf, mmproj-test.gguf}
     ///   models/mlx-community/Test-MLX/{config.json, model.safetensors}
+    ///   models/duckets/Test-Splash/{manifest.json, target/weights.bin, draft/, vision/}
     ///   models/.hidden/Nope/x.gguf            (skipped: hidden)
     ///   models/someone/not-a-model/readme.txt  (skipped: not a model)
     fn fixture() -> PathBuf {
@@ -407,6 +473,13 @@ mod tests {
         .unwrap();
         write_bytes(&mlx_dir.join("model.safetensors"), 50);
 
+        let splash_dir = base.join("duckets").join("Test-Splash");
+        fs::create_dir_all(splash_dir.join("target")).unwrap();
+        fs::create_dir_all(splash_dir.join("draft")).unwrap();
+        fs::create_dir_all(splash_dir.join("vision")).unwrap();
+        fs::write(splash_dir.join("manifest.json"), "{}").unwrap();
+        write_bytes(&splash_dir.join("target").join("weights.bin"), 200);
+
         let hidden_dir = base.join(".hidden").join("Nope");
         fs::create_dir_all(&hidden_dir).unwrap();
         write_bytes(&hidden_dir.join("x.gguf"), 5);
@@ -419,13 +492,22 @@ mod tests {
     }
 
     #[test]
-    fn scan_library_finds_gguf_and_mlx() {
+    fn scan_library_finds_gguf_mlx_and_splash() {
         let base = fixture();
         let entries = scan_library(&base);
-        assert_eq!(entries.len(), 2, "entries: {entries:?}");
+        assert_eq!(entries.len(), 3, "entries: {entries:?}");
 
-        // Sorted by publisher: lmstudio-community before mlx-community.
-        let gguf = &entries[0];
+        // Sorted by publisher: duckets before lmstudio-community
+        // before mlx-community.
+        let splash = &entries[0];
+        assert_eq!(splash.key, "duckets/Test-Splash");
+        assert_eq!(splash.format, ModelFormat::Splash);
+        assert!(splash.vision, "vision/ subdir means vision");
+        // 200 bytes of payload + the 2-byte manifest.json.
+        assert_eq!(splash.size_bytes, 202);
+        assert_eq!(splash.arch, None);
+
+        let gguf = &entries[1];
         assert_eq!(gguf.key, "lmstudio-community/Test-GGUF");
         assert_eq!(gguf.publisher, "lmstudio-community");
         assert_eq!(gguf.display_name, "Test-GGUF");
@@ -434,7 +516,7 @@ mod tests {
         assert!(gguf.vision, "mmproj present means vision");
         assert_eq!(gguf.arch, None);
 
-        let mlx = &entries[1];
+        let mlx = &entries[2];
         assert_eq!(mlx.key, "mlx-community/Test-MLX");
         assert_eq!(mlx.format, ModelFormat::Mlx);
         assert_eq!(mlx.arch.as_deref(), Some("LlamaForCausalLM"));
@@ -530,6 +612,40 @@ mod tests {
         let found = find_llama_server(&base).expect("a llama-server");
         assert!(
             found.ends_with("llama.cpp-mac-arm64-apple-metal-advsimd-2.80.1/llama-server"),
+            "picked: {found:?}"
+        );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn find_omlx_python_picks_highest_build() {
+        let base = std::env::temp_dir().join(format!(
+            "quack-core-omlx-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let amphibian = base.join("vendor").join("_amphibian");
+        for build in [9_u32, 18] {
+            let bin = amphibian
+                .join(format!("app-omlx-mac26-arm64@{build}"))
+                .join("bin");
+            fs::create_dir_all(&bin).unwrap();
+            write_bytes(&bin.join("python"), 8);
+        }
+        // The highest build *without* a python must not win, and
+        // unrelated apps under _amphibian are ignored.
+        fs::create_dir_all(amphibian.join("app-omlx-mac26-arm64@99")).unwrap();
+        let other = amphibian.join("app-something-else@100").join("bin");
+        fs::create_dir_all(&other).unwrap();
+        write_bytes(&other.join("python"), 8);
+
+        let found = find_omlx_python(&base).expect("an omlx python");
+        assert!(
+            found.ends_with("app-omlx-mac26-arm64@18/bin/python"),
             "picked: {found:?}"
         );
 

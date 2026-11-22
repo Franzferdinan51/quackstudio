@@ -1,24 +1,30 @@
 //! quackd — the QuackStudio daemon.
 //!
-//! P1 surface (see ../DESIGN.md):
+//! P2 surface (see ../DESIGN.md):
 //!   GET  /api/v1/models          library index + loaded instances
 //!   GET  /api/v1/status          daemon status
-//!   POST /api/v1/models/load     spawn a backend engine (llama.cpp in P1)
+//!   POST /api/v1/models/load     spawn a backend engine for a model
 //!   POST /api/v1/models/unload   stop an instance by id
 //!   GET  /v1/models              OpenAI-compat list (loaded only)
 //!   POST /v1/chat/completions    proxy to the instance's engine (SSE passthrough)
 //!
-//! The llama.cpp pack is LM Studio's own: quackd finds the newest
-//! `llama-server` under the backends dir and runs it as a child
-//! process on a loopback port, exactly one child per loaded
-//! instance. Chat requests for a downloaded-but-unloaded GGUF are
-//! JIT-loaded through the same path, like LM Studio.
+//! Loads dispatch on the model's format, mirroring LM Studio's
+//! backend preferences:
+//!   GGUF       → llama.cpp pack: the newest `llama-server` under
+//!                the backends dir, one child process per instance.
+//!   MLX        → oMLX pack: the newest oMLX build's Python running
+//!                `mlx_vlm.server`, one child per instance.
+//!   Splash     → 501 until the Splash/Strata pack lands in P3.
+//! Chat requests for a downloaded-but-unloaded model are JIT-loaded
+//! through the same dispatch, like LM Studio.
 //!
 //! Configuration via environment:
 //!   QUACK_PORT          listen port          (default 1234)
 //!   QUACK_MODELS_DIR    models directory     (default ~/.lmstudio/models)
 //!   QUACK_BACKENDS_DIR  backend packs dir    (default ~/.lmstudio/extensions/backends)
 //!   QUACK_LLAMA_SERVER  llama-server binary  (overrides pack discovery)
+//!   QUACK_MLX_PYTHON    MLX python           (overrides oMLX discovery;
+//!                        fallback ~/mlx-venv/bin/python)
 
 use axum::{
     body::Body,
@@ -29,7 +35,10 @@ use axum::{
     Json, Router,
 };
 use futures_util::StreamExt;
-use quack_core::{find_llama_server, main_gguf_path, scan_library, Instance, ModelEntry, ModelFormat};
+use quack_core::{
+    find_llama_server, find_omlx_python, main_gguf_path, scan_library, Instance, ModelEntry,
+    ModelFormat,
+};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -44,8 +53,11 @@ use tower_http::cors::CorsLayer;
 
 /// First loopback port handed out to engine processes.
 const FIRST_ENGINE_PORT: u16 = 18100;
-/// How long a load waits for the engine's `/health` to answer.
+/// How long a llama.cpp load waits for the engine's `/health`.
 const LOAD_HEALTH_TIMEOUT: Duration = Duration::from_secs(180);
+/// How long an MLX load waits for the engine to answer. MLX loads
+/// are slower than llama.cpp's, so the budget is larger.
+const MLX_HEALTH_TIMEOUT: Duration = Duration::from_secs(300);
 
 struct LoadedInstance {
     instance: Instance,
@@ -186,24 +198,127 @@ async fn terminate_child(child: &mut Child) {
     let _ = child.wait().await;
 }
 
-/// Spawn llama-server for a GGUF entry and wait for its `/health`.
-/// On success the instance is registered and returned.
+/// A failed load: HTTP status + the `{"error": …}` body.
+type LoadError = (StatusCode, serde_json::Value);
+
+fn load_error(status: StatusCode, message: String) -> LoadError {
+    (status, error_body(message))
+}
+
+/// Create the per-instance engine log under the temp dir; returns
+/// (stdout handle, stderr handle, path). Its tail is reported when
+/// a load fails.
+fn create_engine_log(
+    tag: &str,
+    entry: &ModelEntry,
+    port: u16,
+) -> Result<(std::fs::File, std::fs::File, PathBuf), LoadError> {
+    let log_path = std::env::temp_dir().join(format!(
+        "quackd-{tag}-{}-{}.log",
+        entry.display_name.replace('/', "_"),
+        port
+    ));
+    let log_file = std::fs::File::create(&log_path).map_err(|e| {
+        load_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("cannot create engine log {}: {e}", log_path.display()),
+        )
+    })?;
+    let log_file_err = log_file.try_clone().map_err(|e| {
+        load_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("cannot clone engine log handle: {e}"),
+        )
+    })?;
+    Ok((log_file, log_file_err, log_path))
+}
+
+/// Poll the engine's health endpoints until one answers 2xx.
+/// Returns false on timeout, and fails fast if the child exits
+/// first.
+async fn wait_for_health(
+    state: &AppState,
+    child: &mut Child,
+    port: u16,
+    timeout: Duration,
+    paths: &[&str],
+) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return false;
+        }
+        for path in paths {
+            let url = format!("http://127.0.0.1:{port}{path}");
+            if let Ok(resp) = state.http.get(&url).send().await {
+                if resp.status().is_success() {
+                    return true;
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    false
+}
+
+/// Register a healthy engine child as a loaded instance.
+async fn register_instance(
+    state: &Arc<AppState>,
+    entry: &ModelEntry,
+    backend: &str,
+    port: u16,
+    pid: u32,
+    child: Child,
+    log_path: PathBuf,
+) -> Instance {
+    let n = state.next_instance.fetch_add(1, Ordering::SeqCst) + 1;
+    let instance = Instance {
+        instance_id: format!("{}#{}", entry.key, n),
+        model_key: entry.key.clone(),
+        backend: backend.to_string(),
+        port,
+        pid,
+    };
+    state.instances.write().await.insert(
+        instance.instance_id.clone(),
+        LoadedInstance {
+            instance: instance.clone(),
+            child,
+            log_path,
+        },
+    );
+    instance
+}
+
+/// Spawn the backend engine for a model, dispatching on format:
+/// GGUF → llama.cpp, MLX → oMLX (`mlx_vlm.server`), Splash → 501
+/// until the Splash/Strata pack lands in P3. On success the
+/// instance is registered and returned.
 async fn spawn_instance(
     state: &Arc<AppState>,
     entry: &ModelEntry,
     context_length: Option<u32>,
     gpu_offload: Option<u32>,
-) -> Result<Instance, (StatusCode, serde_json::Value)> {
-    let err = |status: StatusCode, message: String| (status, error_body(message));
-
-    if entry.format != ModelFormat::Gguf {
-        return Err(err(
+) -> Result<Instance, LoadError> {
+    match entry.format {
+        ModelFormat::Gguf => spawn_llama_instance(state, entry, context_length, gpu_offload).await,
+        ModelFormat::Mlx => spawn_mlx_instance(state, entry).await,
+        ModelFormat::Splash => Err(load_error(
             StatusCode::NOT_IMPLEMENTED,
-            "MLX pack lands in P2".to_string(),
-        ));
+            "Splash/Strata pack lands in P3".to_string(),
+        )),
     }
+}
+
+/// Spawn llama-server for a GGUF entry and wait for its `/health`.
+async fn spawn_llama_instance(
+    state: &Arc<AppState>,
+    entry: &ModelEntry,
+    context_length: Option<u32>,
+    gpu_offload: Option<u32>,
+) -> Result<Instance, LoadError> {
     let server = llama_server_binary(state).ok_or_else(|| {
-        err(
+        load_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!(
                 "no llama.cpp backend pack with a llama-server binary under {}",
@@ -212,30 +327,14 @@ async fn spawn_instance(
         )
     })?;
     let model_path = main_gguf_path(entry).ok_or_else(|| {
-        err(
+        load_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("no main GGUF file found under {}", entry.path.display()),
         )
     })?;
 
     let port = state.next_port.fetch_add(1, Ordering::SeqCst);
-    let log_path = std::env::temp_dir().join(format!(
-        "quackd-llama-{}-{}.log",
-        entry.display_name.replace('/', "_"),
-        port
-    ));
-    let log_file = std::fs::File::create(&log_path).map_err(|e| {
-        err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("cannot create engine log {}: {e}", log_path.display()),
-        )
-    })?;
-    let log_file_err = log_file.try_clone().map_err(|e| {
-        err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("cannot clone engine log handle: {e}"),
-        )
-    })?;
+    let (log_file, log_file_err, log_path) = create_engine_log("llama", entry, port)?;
 
     let mut child = Command::new(&server)
         .arg("--model")
@@ -254,33 +353,16 @@ async fn spawn_instance(
         .stderr(Stdio::from(log_file_err))
         .spawn()
         .map_err(|e| {
-            err(
+            load_error(
                 StatusCode::BAD_GATEWAY,
                 format!("failed to spawn llama-server ({}): {e}", server.display()),
             )
         })?;
     let pid = child.id().unwrap_or(0);
 
-    // Poll /health until the engine is ready; fail fast if the
-    // process exits first.
-    let health_url = format!("http://127.0.0.1:{port}/health");
-    let deadline = Instant::now() + LOAD_HEALTH_TIMEOUT;
-    let mut healthy = false;
-    while Instant::now() < deadline {
-        if matches!(child.try_wait(), Ok(Some(_))) {
-            break;
-        }
-        if let Ok(resp) = state.http.get(&health_url).send().await {
-            if resp.status().is_success() {
-                healthy = true;
-                break;
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
-    if !healthy {
+    if !wait_for_health(state, &mut child, port, LOAD_HEALTH_TIMEOUT, &["/health"]).await {
         terminate_child(&mut child).await;
-        return Err(err(
+        return Err(load_error(
             StatusCode::BAD_GATEWAY,
             format!(
                 "llama-server did not become healthy on port {port}; log tail: {}",
@@ -289,23 +371,92 @@ async fn spawn_instance(
         ));
     }
 
-    let n = state.next_instance.fetch_add(1, Ordering::SeqCst) + 1;
-    let instance = Instance {
-        instance_id: format!("{}#{}", entry.key, n),
-        model_key: entry.key.clone(),
-        backend: "llama.cpp".to_string(),
+    Ok(register_instance(state, entry, "llama.cpp", port, pid, child, log_path).await)
+}
+
+/// The MLX interpreter: `QUACK_MLX_PYTHON` override first, then
+/// the newest oMLX build's Python (it imports `mlx_vlm`), then
+/// the standalone `~/mlx-venv` fallback.
+fn mlx_python(state: &AppState) -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("QUACK_MLX_PYTHON") {
+        let path = PathBuf::from(path);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    if let Some(python) = find_omlx_python(&state.backends_dir) {
+        return Some(python);
+    }
+    let venv_python = home_dir().join("mlx-venv").join("bin").join("python");
+    if venv_python.is_file() {
+        return Some(venv_python);
+    }
+    None
+}
+
+/// Spawn `mlx_vlm.server` (via the oMLX Python) for an MLX entry
+/// and wait for it to answer. `context_length` / `gpu_offload`
+/// have no `mlx_vlm.server` equivalent in P2 and are ignored.
+async fn spawn_mlx_instance(
+    state: &Arc<AppState>,
+    entry: &ModelEntry,
+) -> Result<Instance, LoadError> {
+    let python = mlx_python(state).ok_or_else(|| {
+        load_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!(
+                "no MLX python found (no oMLX build under {}, no ~/mlx-venv); set QUACK_MLX_PYTHON",
+                state.backends_dir.display()
+            ),
+        )
+    })?;
+
+    let port = state.next_port.fetch_add(1, Ordering::SeqCst);
+    let (log_file, log_file_err, log_path) = create_engine_log("mlx", entry, port)?;
+
+    let mut child = Command::new(&python)
+        .arg("-m")
+        .arg("mlx_vlm.server")
+        .arg("--model")
+        .arg(&entry.path)
+        .arg("--host")
+        .arg("127.0.0.1")
+        .arg("--port")
+        .arg(port.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log_file))
+        .stderr(Stdio::from(log_file_err))
+        .spawn()
+        .map_err(|e| {
+            load_error(
+                StatusCode::BAD_GATEWAY,
+                format!("failed to spawn mlx_vlm.server ({}): {e}", python.display()),
+            )
+        })?;
+    let pid = child.id().unwrap_or(0);
+
+    // Current mlx_vlm.server builds expose /health; fall back to
+    // the OpenAI model list on builds that don't.
+    if !wait_for_health(
+        state,
+        &mut child,
         port,
-        pid,
-    };
-    state.instances.write().await.insert(
-        instance.instance_id.clone(),
-        LoadedInstance {
-            instance: instance.clone(),
-            child,
-            log_path,
-        },
-    );
-    Ok(instance)
+        MLX_HEALTH_TIMEOUT,
+        &["/health", "/v1/models"],
+    )
+    .await
+    {
+        terminate_child(&mut child).await;
+        return Err(load_error(
+            StatusCode::BAD_GATEWAY,
+            format!(
+                "mlx_vlm.server did not become healthy on port {port}; log tail: {}",
+                log_tail(&log_path, 2000)
+            ),
+        ));
+    }
+
+    Ok(register_instance(state, entry, "mlx (omlx)", port, pid, child, log_path).await)
 }
 
 #[derive(serde::Deserialize)]
@@ -327,9 +478,9 @@ async fn load_model(
             format!("model not found in the library: {}", req.model),
         );
     };
-    if entry.format != ModelFormat::Gguf {
-        return error_response(StatusCode::NOT_IMPLEMENTED, "MLX pack lands in P2");
-    }
+    // Format dispatch (GGUF / MLX / Splash-501) lives in
+    // spawn_instance; context_length and gpu_offload are GGUF-only
+    // knobs today and are ignored by the MLX spawner.
     let gpu_offload = req.gpu_offload.map(|v| v.round() as u32);
     let started = Instant::now();
     match spawn_instance(&state, &entry, req.context_length, gpu_offload).await {
@@ -404,16 +555,16 @@ async fn chat_completions(State(state): State<Arc<AppState>>, body: axum::body::
         }
     }
 
-    // JIT: a requested, downloaded-but-unloaded GGUF loads on
-    // demand through the same path as POST /api/v1/models/load.
+    // JIT: a requested, downloaded-but-unloaded model loads on
+    // demand through the same format dispatch as
+    // POST /api/v1/models/load (a Splash model surfaces the
+    // dispatch's 501 here).
     if target.is_none() {
         if let Some(model) = &requested {
             if let Some(entry) = resolve_model(&state, model) {
-                if entry.format == ModelFormat::Gguf {
-                    match spawn_instance(&state, &entry, None, None).await {
-                        Ok(instance) => target = Some(instance.port),
-                        Err((status, body)) => return (status, Json(body)).into_response(),
-                    }
+                match spawn_instance(&state, &entry, None, None).await {
+                    Ok(instance) => target = Some(instance.port),
+                    Err((status, body)) => return (status, Json(body)).into_response(),
                 }
             }
         }

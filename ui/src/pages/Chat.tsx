@@ -10,8 +10,9 @@ interface ChatMessage {
 
 type LoadPhase = "none" | "loading" | "ready" | "error";
 
-/** Chat page: model picker pill (loads through quackd's llama.cpp
- *  pack), streaming chat over the OpenAI-compat proxy. */
+/** Chat page: model picker pill (loads through quackd's format
+ *  dispatch — llama.cpp for GGUF, oMLX for MLX), streaming chat
+ *  over the OpenAI-compat proxy. */
 export default function Chat() {
   const [models, setModels] = useState<ModelEntry[]>([]);
   const [pickerOpen, setPickerOpen] = useState(false);
@@ -35,6 +36,17 @@ export default function Chat() {
       .then((data) => {
         if (cancelled) return;
         setModels(data);
+        // Library's "Use in New Chat" leaves the model key in
+        // sessionStorage; adopt (and load) it on arrival.
+        const pending = sessionStorage.getItem("quack.useInChat");
+        if (pending) {
+          sessionStorage.removeItem("quack.useInChat");
+          const wanted = data.find((m) => m.key === pending);
+          if (wanted) {
+            void selectModel(wanted);
+            return;
+          }
+        }
         const already = data.find((m) => m.loaded_instances.length > 0);
         if (already) {
           setSelected(already);
@@ -190,7 +202,7 @@ export default function Chat() {
                 <p className="px-4 py-3 text-muted">No models in the library.</p>
               )}
               {models.map((m) => {
-                const loadable = m.format === "gguf";
+                const loadable = m.format === "gguf" || m.format === "mlx";
                 return (
                   <button
                     key={m.key}

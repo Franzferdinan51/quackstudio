@@ -12,7 +12,7 @@ export interface ModelEntry {
   key: string;
   publisher: string;
   display_name: string;
-  format: "gguf" | "mlx";
+  format: "gguf" | "mlx" | "splash";
   size_bytes: number;
   path: string;
   arch: string | null;

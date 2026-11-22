@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import type { LucideIcon } from "lucide-react";
 import {
   Code2,
@@ -69,6 +69,14 @@ function RailButton({
 
 export default function App() {
   const [page, setPage] = useState<Page>("chat");
+
+  // Library's "Use in New Chat" hands off via this event; the
+  // model key itself rides in sessionStorage for Chat to adopt.
+  useEffect(() => {
+    const onUseInChat = () => setPage("chat");
+    window.addEventListener("quack:use-in-chat", onUseInChat);
+    return () => window.removeEventListener("quack:use-in-chat", onUseInChat);
+  }, []);
 
   return (
     <div className="flex h-full bg-app-bg text-ink">

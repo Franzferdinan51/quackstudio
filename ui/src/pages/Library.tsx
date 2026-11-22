@@ -1,5 +1,5 @@
-import { useEffect, useState } from "react";
-import { Check, Search } from "lucide-react";
+import { useCallback, useEffect, useState } from "react";
+import { Check, Loader2, MessageSquare, Search, Upload, X } from "lucide-react";
 import type { ModelEntry } from "../types";
 import { DAEMON_URL, formatGB } from "../types";
 
@@ -27,31 +27,60 @@ const SAMPLE_ROWS: ModelEntry[] = [
     vision: true,
     loaded_instances: [],
   },
+  {
+    key: "sample/arete-27b-splash",
+    publisher: "sample",
+    display_name: "arete-27b-splash",
+    format: "splash",
+    size_bytes: 14_800_000_000,
+    path: "",
+    arch: null,
+    vision: true,
+    loaded_instances: [],
+  },
 ];
 
-/** Library (My Models): filter bar + model table fed by quackd. */
+type DetailTab = "info" | "load";
+type LoadMessage = { kind: "ok" | "error"; text: string };
+
+/** Library (My Models): filter bar + model table fed by quackd,
+ *  with a detail panel (Info / Load) for the selected model. */
 export default function Library() {
   const [models, setModels] = useState<ModelEntry[]>([]);
   const [offline, setOffline] = useState(false);
   const [filter, setFilter] = useState("");
+  const [selectedKey, setSelectedKey] = useState<string | null>(null);
+  const [tab, setTab] = useState<DetailTab>("info");
+  const [ctxLength, setCtxLength] = useState(8192);
+  const [gpuLayers, setGpuLayers] = useState(99);
+  const [loadBusy, setLoadBusy] = useState(false);
+  const [loadMsg, setLoadMsg] = useState<LoadMessage | null>(null);
+  const [unloadingId, setUnloadingId] = useState<string | null>(null);
+
+  const fetchModels = useCallback(async () => {
+    try {
+      const res = await fetch(`${DAEMON_URL}/api/v1/models`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = (await res.json()) as ModelEntry[];
+      setModels(data);
+      setOffline(false);
+    } catch {
+      setOffline(true);
+    }
+  }, []);
 
   useEffect(() => {
-    let cancelled = false;
-    fetch(`${DAEMON_URL}/api/v1/models`)
-      .then((res) => {
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        return res.json() as Promise<ModelEntry[]>;
-      })
-      .then((data) => {
-        if (!cancelled) setModels(data);
-      })
-      .catch(() => {
-        if (!cancelled) setOffline(true);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+    void fetchModels();
+  }, [fetchModels]);
+
+  // Fresh selection → back to Info, default load config, no stale
+  // load result.
+  useEffect(() => {
+    setTab("info");
+    setCtxLength(8192);
+    setGpuLayers(99);
+    setLoadMsg(null);
+  }, [selectedKey]);
 
   const rows = offline ? SAMPLE_ROWS : models;
   const needle = filter.trim().toLowerCase();
@@ -60,90 +89,408 @@ export default function Library() {
       needle === "" ||
       `${m.publisher}/${m.display_name}`.toLowerCase().includes(needle),
   );
+  const selected = rows.find((m) => m.key === selectedKey) ?? null;
+
+  async function loadSelected() {
+    if (!selected || loadBusy) return;
+    setLoadBusy(true);
+    setLoadMsg(null);
+    try {
+      const res = await fetch(`${DAEMON_URL}/api/v1/models/load`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: selected.key,
+          context_length: ctxLength,
+          gpu_offload: gpuLayers,
+        }),
+      });
+      const data: unknown = await res.json().catch(() => null);
+      if (!res.ok) {
+        const message =
+          data !== null &&
+          typeof data === "object" &&
+          "error" in data &&
+          typeof (data as { error: unknown }).error === "string"
+            ? (data as { error: string }).error
+            : `load failed (HTTP ${res.status})`;
+        throw new Error(message);
+      }
+      const ok = data as {
+        instance_id?: string;
+        load_time_seconds?: number;
+      };
+      setLoadMsg({
+        kind: "ok",
+        text: `Loaded as ${ok.instance_id ?? "?"} in ${(ok.load_time_seconds ?? 0).toFixed(1)}s`,
+      });
+      await fetchModels();
+    } catch (e) {
+      setLoadMsg({
+        kind: "error",
+        text: e instanceof Error ? e.message : String(e),
+      });
+    } finally {
+      setLoadBusy(false);
+    }
+  }
+
+  async function unloadInstance(instanceId: string) {
+    setUnloadingId(instanceId);
+    setLoadMsg(null);
+    try {
+      const res = await fetch(`${DAEMON_URL}/api/v1/models/unload`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ instance_id: instanceId }),
+      });
+      if (!res.ok) {
+        const data: unknown = await res.json().catch(() => null);
+        const message =
+          data !== null &&
+          typeof data === "object" &&
+          "error" in data &&
+          typeof (data as { error: unknown }).error === "string"
+            ? (data as { error: string }).error
+            : `unload failed (HTTP ${res.status})`;
+        throw new Error(message);
+      }
+      setLoadMsg({ kind: "ok", text: `Unloaded ${instanceId}` });
+      await fetchModels();
+    } catch (e) {
+      setLoadMsg({
+        kind: "error",
+        text: e instanceof Error ? e.message : String(e),
+      });
+    } finally {
+      setUnloadingId(null);
+    }
+  }
+
+  function useInNewChat(model: ModelEntry) {
+    sessionStorage.setItem("quack.useInChat", model.key);
+    window.dispatchEvent(new Event("quack:use-in-chat"));
+  }
 
   return (
-    <div className="flex h-full flex-col px-6 py-4">
-      {/* Filter bar */}
-      <div className="flex items-center gap-3">
-        <div className="flex w-72 items-center gap-2 rounded-lg border border-edge bg-panel px-3 py-1.5">
-          <Search size={14} className="shrink-0 text-muted" />
-          <input
-            value={filter}
-            onChange={(e) => setFilter(e.target.value)}
-            placeholder="Filter models…"
-            className="w-full bg-transparent outline-none placeholder:text-muted"
-          />
-        </div>
-        <span className="text-muted">
-          {visible.length} model{visible.length === 1 ? "" : "s"}
-        </span>
-        {offline && (
-          <span className="rounded-full border border-edge bg-panel px-2.5 py-0.5 text-[11px] text-muted">
-            daemon offline — showing sample rows
+    <div className="flex h-full">
+      {/* List column */}
+      <div className="flex min-w-0 flex-1 flex-col px-6 py-4">
+        {/* Filter bar */}
+        <div className="flex items-center gap-3">
+          <div className="flex w-72 items-center gap-2 rounded-lg border border-edge bg-panel px-3 py-1.5">
+            <Search size={14} className="shrink-0 text-muted" />
+            <input
+              value={filter}
+              onChange={(e) => setFilter(e.target.value)}
+              placeholder="Filter models…"
+              className="w-full bg-transparent outline-none placeholder:text-muted"
+            />
+          </div>
+          <span className="text-muted">
+            {visible.length} model{visible.length === 1 ? "" : "s"}
           </span>
-        )}
+          {offline && (
+            <span className="rounded-full border border-edge bg-panel px-2.5 py-0.5 text-[11px] text-muted">
+              daemon offline — showing sample rows
+            </span>
+          )}
+        </div>
+
+        {/* Table */}
+        <div className="mt-4 min-h-0 flex-1 overflow-auto rounded-xl border border-edge">
+          <table className="w-full border-collapse text-left">
+            <thead className="sticky top-0 bg-panel">
+              <tr className="border-b border-edge text-[11px] uppercase tracking-wide text-muted">
+                <th className="px-4 py-2 font-medium">Model</th>
+                <th className="px-4 py-2 font-medium">Device</th>
+                <th className="px-4 py-2 font-medium">Arch</th>
+                <th className="px-4 py-2 font-medium">Params</th>
+                <th className="px-4 py-2 font-medium">Size</th>
+                <th className="px-4 py-2 font-medium">Publisher</th>
+                <th className="px-4 py-2 font-medium">LLM</th>
+              </tr>
+            </thead>
+            <tbody>
+              {visible.map((m) => (
+                <tr
+                  key={m.key}
+                  onClick={() => setSelectedKey(m.key)}
+                  className={`cursor-pointer border-b border-edge/50 transition-colors last:border-0 hover:bg-panel ${
+                    m.key === selectedKey ? "bg-panel-2" : ""
+                  }`}
+                >
+                  <td className="px-4 py-2.5">
+                    <span className="font-medium">{m.display_name}</span>
+                    {offline && (
+                      <span className="ml-2 rounded bg-panel-2 px-1.5 py-0.5 text-[10px] text-muted">
+                        sample
+                      </span>
+                    )}
+                    {m.vision && (
+                      <span className="ml-2 rounded bg-accent/20 px-1.5 py-0.5 text-[10px] text-accent">
+                        vision
+                      </span>
+                    )}
+                    {m.loaded_instances.length > 0 && (
+                      <span className="ml-2 rounded bg-accent/20 px-1.5 py-0.5 text-[10px] text-accent">
+                        loaded
+                      </span>
+                    )}
+                  </td>
+                  <td className="px-4 py-2.5 text-muted">Local</td>
+                  <td className="px-4 py-2.5 text-muted">{m.arch ?? "—"}</td>
+                  <td className="px-4 py-2.5 text-muted">—</td>
+                  <td className="px-4 py-2.5 text-muted">
+                    {formatGB(m.size_bytes)}
+                  </td>
+                  <td className="px-4 py-2.5 text-muted">{m.publisher}</td>
+                  <td className="px-4 py-2.5">
+                    <span className="flex items-center gap-1.5">
+                      <Check size={13} className="text-ok" />
+                      <span className="text-muted">
+                        {m.format.toUpperCase()}
+                      </span>
+                    </span>
+                  </td>
+                </tr>
+              ))}
+              {visible.length === 0 && !offline && (
+                <tr>
+                  <td colSpan={7} className="px-4 py-10 text-center text-muted">
+                    No models found. Download one from Discover.
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
       </div>
 
-      {/* Table */}
-      <div className="mt-4 min-h-0 flex-1 overflow-auto rounded-xl border border-edge">
-        <table className="w-full border-collapse text-left">
-          <thead className="sticky top-0 bg-panel">
-            <tr className="border-b border-edge text-[11px] uppercase tracking-wide text-muted">
-              <th className="px-4 py-2 font-medium">Model</th>
-              <th className="px-4 py-2 font-medium">Device</th>
-              <th className="px-4 py-2 font-medium">Arch</th>
-              <th className="px-4 py-2 font-medium">Params</th>
-              <th className="px-4 py-2 font-medium">Size</th>
-              <th className="px-4 py-2 font-medium">Publisher</th>
-              <th className="px-4 py-2 font-medium">LLM</th>
-            </tr>
-          </thead>
-          <tbody>
-            {visible.map((m) => (
-              <tr
-                key={m.key}
-                className="border-b border-edge/50 transition-colors last:border-0 hover:bg-panel"
+      {/* Detail panel */}
+      {selected && (
+        <aside className="flex w-[380px] shrink-0 flex-col overflow-auto border-l border-edge bg-panel px-5 py-4">
+          <div className="flex items-start gap-2">
+            <div className="min-w-0 flex-1">
+              <p className="text-[15px] font-medium break-words">
+                {selected.display_name}
+              </p>
+              <p className="mt-0.5 text-[12px] text-muted">
+                {selected.publisher} · {selected.format.toUpperCase()}
+                {selected.vision ? " · vision" : ""}
+              </p>
+            </div>
+            <button
+              type="button"
+              title="Close"
+              onClick={() => setSelectedKey(null)}
+              className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg text-muted transition-colors hover:bg-panel-2 hover:text-ink"
+            >
+              <X size={15} />
+            </button>
+          </div>
+
+          <div className="mt-4 flex gap-2">
+            <button
+              type="button"
+              disabled={selected.format === "splash"}
+              title={
+                selected.format === "splash"
+                  ? "Splash arrives with the Strata pack (P3)"
+                  : undefined
+              }
+              onClick={() => useInNewChat(selected)}
+              className="flex flex-1 items-center justify-center gap-1.5 rounded-lg bg-panel-2 px-3 py-2 text-[13px] transition-colors hover:bg-edge disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              <MessageSquare size={14} />
+              Use in New Chat
+            </button>
+            <button
+              type="button"
+              onClick={() => setTab("load")}
+              className="flex flex-1 items-center justify-center gap-1.5 rounded-lg bg-panel-2 px-3 py-2 text-[13px] transition-colors hover:bg-edge"
+            >
+              <Upload size={14} />
+              Load Model
+            </button>
+          </div>
+
+          {/* Tabs */}
+          <div className="mt-5 flex gap-4 border-b border-edge">
+            {(
+              [
+                ["info", "Info"],
+                ["load", "Load"],
+              ] as [DetailTab, string][]
+            ).map(([value, label]) => (
+              <button
+                key={value}
+                type="button"
+                onClick={() => setTab(value)}
+                className={`border-b-2 px-1 pb-2 text-[13px] transition-colors ${
+                  tab === value
+                    ? "border-accent text-ink"
+                    : "border-transparent text-muted hover:text-ink"
+                }`}
               >
-                <td className="px-4 py-2.5">
-                  <span className="font-medium">{m.display_name}</span>
-                  {offline && (
-                    <span className="ml-2 rounded bg-panel-2 px-1.5 py-0.5 text-[10px] text-muted">
-                      sample
-                    </span>
-                  )}
-                  {m.vision && (
-                    <span className="ml-2 rounded bg-accent/20 px-1.5 py-0.5 text-[10px] text-accent">
-                      vision
-                    </span>
-                  )}
-                </td>
-                <td className="px-4 py-2.5 text-muted">Local</td>
-                <td className="px-4 py-2.5 text-muted">{m.arch ?? "—"}</td>
-                <td className="px-4 py-2.5 text-muted">—</td>
-                <td className="px-4 py-2.5 text-muted">
-                  {formatGB(m.size_bytes)}
-                </td>
-                <td className="px-4 py-2.5 text-muted">{m.publisher}</td>
-                <td className="px-4 py-2.5">
-                  <span className="flex items-center gap-1.5">
-                    <Check size={13} className="text-ok" />
-                    <span className="text-muted">
-                      {m.format.toUpperCase()}
-                    </span>
-                  </span>
-                </td>
-              </tr>
+                {label}
+              </button>
             ))}
-            {visible.length === 0 && !offline && (
-              <tr>
-                <td colSpan={7} className="px-4 py-10 text-center text-muted">
-                  No models found. Download one from Discover.
-                </td>
-              </tr>
-            )}
-          </tbody>
-        </table>
-      </div>
+          </div>
+
+          {tab === "info" && (
+            <dl className="mt-4 flex flex-col gap-3 text-[13px]">
+              {[
+                ["Format", selected.format.toUpperCase()],
+                ["Arch", selected.arch ?? "—"],
+                ["Size", formatGB(selected.size_bytes)],
+                ["Vision", selected.vision ? "Yes" : "No"],
+                ["Publisher", selected.publisher],
+                ["Key", selected.key],
+              ].map(([label, value]) => (
+                <div key={label} className="flex items-baseline gap-3">
+                  <dt className="w-20 shrink-0 text-muted">{label}</dt>
+                  <dd className="min-w-0 break-words">{value}</dd>
+                </div>
+              ))}
+              <div className="flex items-baseline gap-3">
+                <dt className="w-20 shrink-0 text-muted">Path</dt>
+                <dd className="min-w-0 text-[12px] break-all text-muted">
+                  {selected.path || "—"}
+                </dd>
+              </div>
+            </dl>
+          )}
+
+          {tab === "load" && (
+            <div className="mt-4 flex flex-col gap-5">
+              {selected.loaded_instances.map((inst) => (
+                <div
+                  key={inst.instance_id}
+                  className="rounded-xl border border-edge bg-panel-2 px-3.5 py-3"
+                >
+                  <p className="text-[13px] font-medium break-all">
+                    {inst.instance_id}
+                  </p>
+                  <p className="mt-0.5 text-[12px] text-muted">
+                    {inst.backend} · port {inst.port} · pid {inst.pid}
+                  </p>
+                  <button
+                    type="button"
+                    disabled={unloadingId === inst.instance_id}
+                    onClick={() => void unloadInstance(inst.instance_id)}
+                    className="mt-2.5 flex items-center gap-1.5 rounded-lg bg-panel px-3 py-1.5 text-[12px] transition-colors hover:bg-edge disabled:cursor-not-allowed disabled:opacity-40"
+                  >
+                    {unloadingId === inst.instance_id && (
+                      <Loader2 size={13} className="animate-spin" />
+                    )}
+                    Unload
+                  </button>
+                </div>
+              ))}
+
+              <div>
+                <div className="flex items-center justify-between">
+                  <label
+                    htmlFor="qs-ctx"
+                    className="text-[13px] text-muted"
+                  >
+                    Context Length
+                  </label>
+                  <input
+                    id="qs-ctx"
+                    type="number"
+                    min={1024}
+                    max={262144}
+                    step={1024}
+                    value={ctxLength}
+                    onChange={(e) =>
+                      setCtxLength(
+                        Math.min(
+                          262144,
+                          Math.max(1024, Number(e.target.value) || 1024),
+                        ),
+                      )
+                    }
+                    className="w-24 rounded-lg border border-edge bg-panel-2 px-2 py-1 text-right text-[13px] outline-none"
+                  />
+                </div>
+                <input
+                  type="range"
+                  min={1024}
+                  max={262144}
+                  step={1024}
+                  value={ctxLength}
+                  onChange={(e) => setCtxLength(Number(e.target.value))}
+                  className="mt-2 w-full accent-accent"
+                />
+                {selected.format !== "gguf" && (
+                  <p className="mt-1 text-[11px] text-muted">
+                    Context length is passed to llama.cpp only in P2; the
+                    MLX server uses its own default.
+                  </p>
+                )}
+              </div>
+
+              <div>
+                <div className="flex items-center justify-between">
+                  <label
+                    htmlFor="qs-gpu"
+                    className="text-[13px] text-muted"
+                  >
+                    GPU Offload (layers)
+                  </label>
+                  <span className="text-[13px]">{gpuLayers}</span>
+                </div>
+                <input
+                  id="qs-gpu"
+                  type="range"
+                  min={0}
+                  max={99}
+                  step={1}
+                  value={gpuLayers}
+                  disabled={selected.format !== "gguf"}
+                  onChange={(e) => setGpuLayers(Number(e.target.value))}
+                  className="mt-2 w-full accent-accent disabled:cursor-not-allowed disabled:opacity-40"
+                />
+                {selected.format !== "gguf" && (
+                  <p className="mt-1 text-[11px] text-muted">
+                    GPU offload layers apply to GGUF (llama.cpp) models
+                    only.
+                  </p>
+                )}
+              </div>
+
+              {selected.format === "splash" && (
+                <p className="rounded-xl border border-edge bg-panel-2 px-3.5 py-3 text-[12px] text-muted">
+                  Splash arrives with the Strata pack (P3) — this model
+                  can't be loaded yet.
+                </p>
+              )}
+
+              <button
+                type="button"
+                disabled={selected.format === "splash" || loadBusy}
+                onClick={() => void loadSelected()}
+                className="flex items-center justify-center gap-2 rounded-lg bg-primary px-3 py-2 text-[13px] font-medium text-white transition-opacity disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                {loadBusy && <Loader2 size={14} className="animate-spin" />}
+                {loadBusy ? "Loading…" : "Load Model"}
+              </button>
+
+              {loadMsg && (
+                <p
+                  className={`max-h-40 overflow-auto text-[12px] break-words whitespace-pre-wrap ${
+                    loadMsg.kind === "ok" ? "text-ok" : "text-red-400"
+                  }`}
+                >
+                  {loadMsg.text}
+                </p>
+              )}
+            </div>
+          )}
+        </aside>
+      )}
     </div>
   );
 }

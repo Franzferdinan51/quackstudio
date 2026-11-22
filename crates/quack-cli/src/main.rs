@@ -154,6 +154,7 @@ fn cmd_ls() -> Result<(), String> {
             match m.format {
                 quack_core::ModelFormat::Gguf => "gguf",
                 quack_core::ModelFormat::Mlx => "mlx",
+                quack_core::ModelFormat::Splash => "splash",
             },
             m.size_bytes as f64 / 1_000_000_000.0
         );
@@ -163,23 +164,66 @@ fn cmd_ls() -> Result<(), String> {
 
 fn cmd_ps() -> Result<(), String> {
     let payload = get_models_json()?;
-    let mut any = false;
+    // One row per loaded instance, parsed out of each model's
+    // `loaded_instances` (quack-core's Instance shape).
+    let mut rows: Vec<[String; 5]> = Vec::new();
     if let Some(models) = payload.as_array() {
         for model in models {
             if let Some(instances) = model.get("loaded_instances").and_then(|v| v.as_array()) {
                 for instance in instances {
-                    any = true;
-                    println!(
-                        "{}  {}",
-                        model.get("key").and_then(|v| v.as_str()).unwrap_or("?"),
+                    let text = |field: &str| {
                         instance
-                    );
+                            .get(field)
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("?")
+                            .to_string()
+                    };
+                    let number = |field: &str| {
+                        instance
+                            .get(field)
+                            .and_then(|v| v.as_u64())
+                            .map(|n| n.to_string())
+                            .unwrap_or_else(|| "?".to_string())
+                    };
+                    rows.push([
+                        text("instance_id"),
+                        text("model_key"),
+                        text("backend"),
+                        number("port"),
+                        number("pid"),
+                    ]);
                 }
             }
         }
     }
-    if !any {
+    if rows.is_empty() {
         println!("no models loaded");
+        return Ok(());
+    }
+    let header = ["INSTANCE", "MODEL", "BACKEND", "PORT", "PID"];
+    let mut widths: Vec<usize> = header.iter().map(|h| h.len()).collect();
+    for row in &rows {
+        for (i, cell) in row.iter().enumerate() {
+            widths[i] = widths[i].max(cell.len());
+        }
+    }
+    let print_row = |row: &[String; 5]| {
+        println!(
+            "{:<w0$}  {:<w1$}  {:<w2$}  {:<w3$}  {}",
+            row[0],
+            row[1],
+            row[2],
+            row[3],
+            row[4],
+            w0 = widths[0],
+            w1 = widths[1],
+            w2 = widths[2],
+            w3 = widths[3],
+        );
+    };
+    print_row(&header.map(str::to_string));
+    for row in &rows {
+        print_row(row);
     }
     Ok(())
 }

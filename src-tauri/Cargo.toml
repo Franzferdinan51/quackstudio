@@ -1,0 +1,12 @@
+[package]
+name = "quackstudio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "QuackStudio desktop app — Tauri shell around the React UI; talks to quackd over its public HTTP API."
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }

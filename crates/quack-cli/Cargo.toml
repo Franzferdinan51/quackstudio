@@ -1,0 +1,16 @@
+[package]
+name = "quack-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "quack — the QuackStudio command-line client (lms-shaped subset)."
+
+[[bin]]
+name = "quack"
+path = "src/main.rs"
+
+[dependencies]
+quack-core = { path = "../quack-core" }
+clap = { version = "4", features = ["derive"] }
+ureq = "3"
+serde_json = "1"

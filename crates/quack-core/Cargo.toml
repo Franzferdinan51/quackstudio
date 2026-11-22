@@ -1,0 +1,10 @@
+[package]
+name = "quack-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shared types and library scanning for QuackStudio (model index, load configs, backend packs)."
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

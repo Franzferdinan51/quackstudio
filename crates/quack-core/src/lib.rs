@@ -1,0 +1,411 @@
+//! quack-core — shared types for QuackStudio.
+//!
+//! The model library index (filesystem scan of a two-level
+//! `publisher/model` directory, LM Studio layout), per-model load
+//! configuration using LM Studio's KV field names, and backend pack
+//! manifests (`backend-manifest.json`, same shape LM Studio ships).
+
+use serde::{Deserialize, Serialize};
+use std::fs;
+use std::path::{Path, PathBuf};
+
+// ---------------------------------------------------------------------------
+// Model library
+// ---------------------------------------------------------------------------
+
+/// On-disk model format, as QuackStudio understands it in P0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ModelFormat {
+    Gguf,
+    Mlx,
+}
+
+/// One downloaded model in the library.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelEntry {
+    /// Canonical `publisher/model` identifier.
+    pub key: String,
+    pub publisher: String,
+    /// Model directory name (what the Library table shows).
+    pub display_name: String,
+    pub format: ModelFormat,
+    /// Recursive size of the model directory, in bytes.
+    pub size_bytes: u64,
+    /// Path of the model directory on disk.
+    pub path: PathBuf,
+    /// Architecture string when known (MLX `config.json` today; GGUF
+    /// header parsing lands later).
+    pub arch: Option<String>,
+    /// True when the model ships a vision projector (GGUF `mmproj`)
+    /// or declares a vision tower (MLX `vision_config`).
+    pub vision: bool,
+}
+
+/// Scan a two-level `publisher/model` models directory.
+///
+/// - A model dir containing `.gguf` files is a GGUF model. It must
+///   contain a main file — the largest `.gguf` whose name lacks
+///   "mmproj" — and `vision` is set when an `mmproj` file is present.
+/// - A model dir with a top-level `config.json` plus `*.safetensors`
+///   files is an MLX model; `arch` comes from `config.json`
+///   `"architectures"[0]` when parseable.
+/// - Anything else is skipped, as are hidden directories at either
+///   level.
+///
+/// Results are sorted by publisher, then display name.
+pub fn scan_library(models_dir: &Path) -> Vec<ModelEntry> {
+    let mut entries = Vec::new();
+    let Ok(publishers) = fs::read_dir(models_dir) else {
+        return entries;
+    };
+    for publisher_entry in publishers.flatten() {
+        let publisher = publisher_entry.file_name().to_string_lossy().into_owned();
+        if publisher.starts_with('.') {
+            continue;
+        }
+        let publisher_path = publisher_entry.path();
+        if !publisher_path.is_dir() {
+            continue;
+        }
+        let Ok(models) = fs::read_dir(&publisher_path) else {
+            continue;
+        };
+        for model_entry in models.flatten() {
+            let model_name = model_entry.file_name().to_string_lossy().into_owned();
+            if model_name.starts_with('.') {
+                continue;
+            }
+            let model_path = model_entry.path();
+            if !model_path.is_dir() {
+                continue;
+            }
+            if let Some(entry) = scan_model_dir(&publisher, &model_name, &model_path) {
+                entries.push(entry);
+            }
+        }
+    }
+    entries.sort_by(|a, b| {
+        a.publisher
+            .cmp(&b.publisher)
+            .then_with(|| a.display_name.cmp(&b.display_name))
+    });
+    entries
+}
+
+fn scan_model_dir(publisher: &str, name: &str, dir: &Path) -> Option<ModelEntry> {
+    let mut files: Vec<(PathBuf, u64)> = Vec::new();
+    walk_files(dir, &mut files);
+    let size_bytes: u64 = files.iter().map(|(_, size)| *size).sum();
+    let file_name = |p: &Path| {
+        p.file_name()
+            .map(|n| n.to_string_lossy().to_lowercase())
+            .unwrap_or_default()
+    };
+
+    // GGUF: needs a main file (largest .gguf that is not an mmproj).
+    let ggufs: Vec<&(PathBuf, u64)> = files
+        .iter()
+        .filter(|(p, _)| file_name(p).ends_with(".gguf"))
+        .collect();
+    let has_mmproj = files.iter().any(|(p, _)| file_name(p).contains("mmproj"));
+    let main_gguf = ggufs
+        .iter()
+        .filter(|(p, _)| !file_name(p).contains("mmproj"))
+        .max_by_key(|(_, size)| *size);
+    if main_gguf.is_some() {
+        return Some(ModelEntry {
+            key: format!("{publisher}/{name}"),
+            publisher: publisher.to_string(),
+            display_name: name.to_string(),
+            format: ModelFormat::Gguf,
+            size_bytes,
+            path: dir.to_path_buf(),
+            arch: None,
+            vision: has_mmproj,
+        });
+    }
+
+    // MLX: config.json + safetensors weights.
+    let config_path = dir.join("config.json");
+    let has_safetensors = files
+        .iter()
+        .any(|(p, _)| file_name(p).ends_with(".safetensors"));
+    if config_path.is_file() && has_safetensors {
+        let config_text = fs::read_to_string(&config_path).unwrap_or_default();
+        let arch = serde_json::from_str::<serde_json::Value>(&config_text)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("architectures")?
+                    .as_array()?
+                    .first()?
+                    .as_str()
+                    .map(str::to_owned)
+            });
+        let vision = config_text.contains("\"vision_config\"");
+        return Some(ModelEntry {
+            key: format!("{publisher}/{name}"),
+            publisher: publisher.to_string(),
+            display_name: name.to_string(),
+            format: ModelFormat::Mlx,
+            size_bytes,
+            path: dir.to_path_buf(),
+            arch,
+            vision,
+        });
+    }
+
+    None
+}
+
+/// Recursively collect `(path, size)` for every non-hidden file under
+/// `dir`. Unreadable entries are skipped silently — a partially
+/// readable library should still index.
+fn walk_files(dir: &Path, out: &mut Vec<(PathBuf, u64)>) {
+    let Ok(read_dir) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in read_dir.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') {
+            continue;
+        }
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        let path = entry.path();
+        if file_type.is_dir() {
+            walk_files(&path, out);
+        } else if file_type.is_file() {
+            let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+            out.push((path, size));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Load configuration (LM Studio KV field names)
+// ---------------------------------------------------------------------------
+
+/// Per-model load configuration. Field names on the wire are LM
+/// Studio's (`contextLength`, `gpuOffload`, …) so presets and muscle
+/// memory transfer. Every field is optional: `None` means "engine
+/// default", resolved by [`LoadConfig::default_for`].
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoadConfig {
+    pub context_length: Option<u32>,
+    pub gpu_offload: Option<f32>,
+    pub eval_batch_size: Option<u32>,
+    pub physical_batch_size: Option<u32>,
+    pub flash_attention: Option<bool>,
+    pub num_experts: Option<u32>,
+}
+
+impl LoadConfig {
+    /// Built-in defaults for a model, mirroring LM Studio's
+    /// out-of-the-box behaviour per format. Fields a format does not
+    /// use stay `None` (the engine ignores them).
+    pub fn default_for(entry: &ModelEntry) -> Self {
+        match entry.format {
+            ModelFormat::Gguf => LoadConfig {
+                context_length: Some(4096),
+                gpu_offload: Some(1.0),
+                eval_batch_size: Some(512),
+                physical_batch_size: Some(512),
+                flash_attention: Some(false),
+                num_experts: None,
+            },
+            ModelFormat::Mlx => LoadConfig {
+                context_length: Some(4096),
+                gpu_offload: None,
+                eval_batch_size: None,
+                physical_batch_size: None,
+                flash_attention: None,
+                num_experts: None,
+            },
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Backend packs
+// ---------------------------------------------------------------------------
+
+/// A backend pack manifest — `backend-manifest.json`, the same shape
+/// LM Studio ships under `~/.lmstudio/extensions/backends/`. Parsed
+/// loosely: unknown fields are ignored, missing lists default empty.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PackManifest {
+    pub name: String,
+    pub version: String,
+    /// Capability domains the pack serves, e.g. `["llm", "embeddings"]`.
+    #[serde(default)]
+    pub domains: Vec<String>,
+    /// Model formats the pack can load, e.g. `["gguf"]`.
+    #[serde(default)]
+    pub formats: Vec<String>,
+}
+
+/// Scan a backends directory: every immediate subdirectory holding a
+/// parseable `backend-manifest.json` contributes one manifest.
+/// Sorted by pack name.
+pub fn scan_packs(backends_dir: &Path) -> Vec<PackManifest> {
+    let mut packs = Vec::new();
+    let Ok(read_dir) = fs::read_dir(backends_dir) else {
+        return packs;
+    };
+    for entry in read_dir.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let manifest_path = path.join("backend-manifest.json");
+        if let Ok(text) = fs::read_to_string(&manifest_path) {
+            if let Ok(manifest) = serde_json::from_str::<PackManifest>(&text) {
+                packs.push(manifest);
+            }
+        }
+    }
+    packs.sort_by(|a, b| a.name.cmp(&b.name));
+    packs
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    fn write_bytes(path: &Path, n: usize) {
+        let mut f = fs::File::create(path).unwrap();
+        f.write_all(&vec![0u8; n]).unwrap();
+    }
+
+    /// Fixture tree:
+    ///   models/lmstudio-community/Test-GGUF/{test-q4_k_m.gguf, mmproj-test.gguf}
+    ///   models/mlx-community/Test-MLX/{config.json, model.safetensors}
+    ///   models/.hidden/Nope/x.gguf            (skipped: hidden)
+    ///   models/someone/not-a-model/readme.txt  (skipped: not a model)
+    fn fixture() -> PathBuf {
+        let base = std::env::temp_dir().join(format!(
+            "quack-core-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let gguf_dir = base.join("lmstudio-community").join("Test-GGUF");
+        fs::create_dir_all(&gguf_dir).unwrap();
+        write_bytes(&gguf_dir.join("test-q4_k_m.gguf"), 100);
+        write_bytes(&gguf_dir.join("mmproj-test.gguf"), 10);
+
+        let mlx_dir = base.join("mlx-community").join("Test-MLX");
+        fs::create_dir_all(&mlx_dir).unwrap();
+        fs::write(
+            mlx_dir.join("config.json"),
+            r#"{"architectures": ["LlamaForCausalLM"]}"#,
+        )
+        .unwrap();
+        write_bytes(&mlx_dir.join("model.safetensors"), 50);
+
+        let hidden_dir = base.join(".hidden").join("Nope");
+        fs::create_dir_all(&hidden_dir).unwrap();
+        write_bytes(&hidden_dir.join("x.gguf"), 5);
+
+        let junk_dir = base.join("someone").join("not-a-model");
+        fs::create_dir_all(&junk_dir).unwrap();
+        fs::write(junk_dir.join("readme.txt"), "hi").unwrap();
+
+        base
+    }
+
+    #[test]
+    fn scan_library_finds_gguf_and_mlx() {
+        let base = fixture();
+        let entries = scan_library(&base);
+        assert_eq!(entries.len(), 2, "entries: {entries:?}");
+
+        // Sorted by publisher: lmstudio-community before mlx-community.
+        let gguf = &entries[0];
+        assert_eq!(gguf.key, "lmstudio-community/Test-GGUF");
+        assert_eq!(gguf.publisher, "lmstudio-community");
+        assert_eq!(gguf.display_name, "Test-GGUF");
+        assert_eq!(gguf.format, ModelFormat::Gguf);
+        assert_eq!(gguf.size_bytes, 110);
+        assert!(gguf.vision, "mmproj present means vision");
+        assert_eq!(gguf.arch, None);
+
+        let mlx = &entries[1];
+        assert_eq!(mlx.key, "mlx-community/Test-MLX");
+        assert_eq!(mlx.format, ModelFormat::Mlx);
+        assert_eq!(mlx.arch.as_deref(), Some("LlamaForCausalLM"));
+        assert!(!mlx.vision);
+        // 50 bytes of weights + the config.json bytes.
+        assert!(mlx.size_bytes > 50);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn scan_library_missing_dir_is_empty() {
+        let entries = scan_library(Path::new("/nonexistent/quack/models"));
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn load_config_uses_lm_studio_field_names() {
+        let entry = ModelEntry {
+            key: "p/m".into(),
+            publisher: "p".into(),
+            display_name: "m".into(),
+            format: ModelFormat::Gguf,
+            size_bytes: 0,
+            path: PathBuf::from("/tmp/m"),
+            arch: None,
+            vision: false,
+        };
+        let cfg = LoadConfig::default_for(&entry);
+        let json = serde_json::to_value(&cfg).unwrap();
+        assert_eq!(json["contextLength"], 4096);
+        assert_eq!(json["gpuOffload"], 1.0);
+        assert_eq!(json["evalBatchSize"], 512);
+        assert_eq!(json["physicalBatchSize"], 512);
+        assert_eq!(json["flashAttention"], false);
+        assert!(json["numExperts"].is_null());
+    }
+
+    #[test]
+    fn scan_packs_reads_manifests() {
+        let base = std::env::temp_dir().join(format!(
+            "quack-core-packs-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let pack_dir = base.join("llama.cpp-mac-arm64@2.80.1");
+        fs::create_dir_all(&pack_dir).unwrap();
+        fs::write(
+            pack_dir.join("backend-manifest.json"),
+            r#"{"name": "llama.cpp", "version": "2.80.1", "domains": ["llm"], "formats": ["gguf"], "extra": true}"#,
+        )
+        .unwrap();
+        let empty_dir = base.join("no-manifest-here");
+        fs::create_dir_all(&empty_dir).unwrap();
+
+        let packs = scan_packs(&base);
+        assert_eq!(packs.len(), 1);
+        assert_eq!(packs[0].name, "llama.cpp");
+        assert_eq!(packs[0].version, "2.80.1");
+        assert_eq!(packs[0].formats, vec!["gguf".to_string()]);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+}

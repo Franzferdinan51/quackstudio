@@ -22,7 +22,10 @@
 //!                the backends dir, one child process per instance.
 //!   MLX        → oMLX pack: the newest oMLX build's Python running
 //!                `mlx_vlm.server`, one child per instance.
-//!   Splash     → 501 until the Splash/Strata pack lands.
+//!   Splash     → Splash pack: the pack's amphibian Python running
+//!                the `splash_engine` server (OpenAI-compatible
+//!                HTTP on loopback, per-instance API key), one
+//!                child process per instance.
 //!   Maya       → remote pack: Maya providers are OpenAI-compatible
 //!                servers of their own; their models are listed as
 //!                remote library entries (key `maya/<provider>/<id>`),
@@ -58,8 +61,8 @@ use axum::{
 };
 use futures_util::StreamExt;
 use quack_core::{
-    default_maya_providers, find_llama_server, find_omlx_python, main_gguf_path, scan_library,
-    Instance, MayaProvider, ModelEntry, ModelFormat,
+    default_maya_providers, find_llama_server, find_omlx_python, find_splash_pack, main_gguf_path,
+    scan_library, Instance, MayaProvider, ModelEntry, ModelFormat,
 };
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
@@ -81,6 +84,10 @@ const LOAD_HEALTH_TIMEOUT: Duration = Duration::from_secs(180);
 /// How long an MLX load waits for the engine to answer. MLX loads
 /// are slower than llama.cpp's, so the budget is larger.
 const MLX_HEALTH_TIMEOUT: Duration = Duration::from_secs(300);
+/// How long a Splash load waits for `GET /ready`. LM Studio's own
+/// host allows 10 minutes for a Splash load (a 27B package reads
+/// ~17 GB of weights before the engine reports ready); match it.
+const SPLASH_READY_TIMEOUT: Duration = Duration::from_secs(600);
 
 struct LoadedInstance {
     instance: Instance,
@@ -100,6 +107,15 @@ struct LoadedInstance {
     /// Context length the instance was loaded with, when the
     /// caller specified one (llama.cpp only today).
     context_length: Option<u32>,
+    /// Per-instance engine API key, sent as `Authorization:
+    /// Bearer …` by the chat proxy (Splash pack only today;
+    /// `None` for engines that take no key).
+    api_key: Option<String>,
+    /// Signal that asks this instance's engine to shut down
+    /// gracefully: SIGTERM for llama.cpp / MLX, SIGINT for the
+    /// Splash pack (its host's documented graceful signal; the
+    /// server treats both the same, SIGINT is the contract).
+    stop_signal: i32,
 }
 
 struct AppState {
@@ -306,10 +322,14 @@ fn packs_info(state: &AppState) -> serde_json::Value {
             .unwrap_or_else(|| "omlx".to_string()),
         None => "not found".to_string(),
     };
+    let splash = match find_splash_pack(&state.backends_dir) {
+        Some(pack) => pack.version,
+        None => "not bundled".to_string(),
+    };
     serde_json::json!({
         "llama": llama,
         "mlx": mlx,
-        "splash": "not bundled",
+        "splash": splash,
     })
 }
 
@@ -582,11 +602,17 @@ fn log_tail(path: &PathBuf, max_chars: usize) -> String {
 /// Terminate an engine child: SIGTERM, a short grace period, then
 /// SIGKILL. Always reaps the child.
 async fn terminate_child(child: &mut Child) {
+    terminate_child_with(child, libc::SIGTERM).await;
+}
+
+/// Terminate an engine child with a chosen graceful signal, a
+/// short grace period, then SIGKILL. Always reaps the child.
+async fn terminate_child_with(child: &mut Child, signal: i32) {
     if let Some(pid) = child.id() {
         // SAFETY: kill(2) with a pid we spawned and have not reaped;
         // the worst case is ESRCH if it already exited.
         unsafe {
-            libc::kill(pid as i32, libc::SIGTERM);
+            libc::kill(pid as i32, signal);
         }
         for _ in 0..20 {
             match child.try_wait() {
@@ -663,6 +689,7 @@ async fn wait_for_health(
 }
 
 /// Register a healthy engine child as a loaded instance.
+#[allow(clippy::too_many_arguments)]
 async fn register_instance(
     state: &Arc<AppState>,
     entry: &ModelEntry,
@@ -672,6 +699,8 @@ async fn register_instance(
     child: Child,
     log_path: PathBuf,
     context_length: Option<u32>,
+    api_key: Option<String>,
+    stop_signal: i32,
 ) -> Instance {
     let n = state.next_instance.fetch_add(1, Ordering::SeqCst) + 1;
     let instance = Instance {
@@ -690,14 +719,16 @@ async fn register_instance(
             log_path,
             size_bytes: entry.size_bytes,
             context_length,
+            api_key,
+            stop_signal,
         },
     );
     instance
 }
 
 /// Spawn the backend engine for a model, dispatching on format:
-/// GGUF → llama.cpp, MLX → oMLX (`mlx_vlm.server`), Splash → 501
-/// until the Splash/Strata pack lands. On success the instance
+/// GGUF → llama.cpp, MLX → oMLX (`mlx_vlm.server`), Splash → the
+/// Splash pack's `splash_engine` server. On success the instance
 /// is registered and returned. Maya entries never reach here:
 /// they are not in the local library scan, and their loads are
 /// answered by `maya_load` before local resolution.
@@ -726,10 +757,7 @@ async fn spawn_instance(
             spawn_llama_instance(state, entry, context_length, gpu_offload, knobs).await
         }
         ModelFormat::Mlx => spawn_mlx_instance(state, entry).await,
-        ModelFormat::Splash => Err(load_error(
-            StatusCode::NOT_IMPLEMENTED,
-            "Splash/Strata pack lands in P3".to_string(),
-        )),
+        ModelFormat::Splash => spawn_splash_instance(state, entry).await,
         ModelFormat::Maya => Err(load_error(
             StatusCode::BAD_REQUEST,
             "Maya models are served by Maya and cannot be loaded locally".to_string(),
@@ -820,6 +848,8 @@ async fn spawn_llama_instance(
         child,
         log_path,
         context_length,
+        None,
+        libc::SIGTERM,
     )
     .await)
 }
@@ -906,7 +936,198 @@ async fn spawn_mlx_instance(
         ));
     }
 
-    Ok(register_instance(state, entry, "mlx (omlx)", port, pid, child, log_path, None).await)
+    Ok(register_instance(
+        state,
+        entry,
+        "mlx (omlx)",
+        port,
+        pid,
+        child,
+        log_path,
+        None,
+        None,
+        libc::SIGTERM,
+    )
+    .await)
+}
+
+/// A random per-instance API key (32 bytes from `/dev/urandom`,
+/// hex-encoded). The Splash server takes it via `SPLASH_API_KEY`
+/// and the chat proxy presents it as a Bearer token.
+fn random_api_key() -> Result<String, LoadError> {
+    let mut buf = [0u8; 32];
+    std::io::Read::read_exact(&mut std::fs::File::open("/dev/urandom").map_err(|e| {
+        load_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("cannot open /dev/urandom for an instance API key: {e}"),
+        )
+    })?, &mut buf)
+    .map_err(|e| {
+        load_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("cannot read /dev/urandom for an instance API key: {e}"),
+        )
+    })?;
+    Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Poll the Splash server's `GET /ready` (with the instance key)
+/// until its JSON body reports `{"status":"ready"}`. Fails fast
+/// if the child exits first.
+async fn wait_for_splash_ready(
+    state: &AppState,
+    child: &mut Child,
+    port: u16,
+    api_key: &str,
+    timeout: Duration,
+) -> bool {
+    let deadline = Instant::now() + timeout;
+    let url = format!("http://127.0.0.1:{port}/ready");
+    while Instant::now() < deadline {
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return false;
+        }
+        if let Ok(resp) = state
+            .http
+            .get(&url)
+            .header(header::AUTHORIZATION, format!("Bearer {api_key}"))
+            .send()
+            .await
+        {
+            if resp.status().is_success() {
+                if let Ok(value) = resp.json::<serde_json::Value>().await {
+                    if value.get("status").and_then(|v| v.as_str()) == Some("ready") {
+                        return true;
+                    }
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    false
+}
+
+/// Spawn the Splash pack's server for a Splash entry and wait
+/// for readiness. The spawn mirrors LM Studio's own host
+/// (`buildSpawnCommand` for pack ≥ 1.3.0, recovered in the P6
+/// REA pass): the pack's amphibian Python runs `-m splash_engine`
+/// with the package root positional, memory/context on `auto`
+/// (the Library sliders are not applied — the engine sizes
+/// itself), and a per-instance API key in the environment.
+/// Readiness is `GET /ready`; the actualized context length is
+/// then read from `GET /status` (`maximum_context_tokens`).
+/// `context_length` / `gpu_offload` / knobs have no Splash
+/// equivalents and are ignored, like MLX.
+async fn spawn_splash_instance(
+    state: &Arc<AppState>,
+    entry: &ModelEntry,
+) -> Result<Instance, LoadError> {
+    let pack = find_splash_pack(&state.backends_dir).ok_or_else(|| {
+        load_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!(
+                "no Splash backend pack with a usable server under {}",
+                state.backends_dir.display()
+            ),
+        )
+    })?;
+    let api_key = random_api_key()?;
+
+    let port = state.next_port.fetch_add(1, Ordering::SeqCst);
+    let (log_file, log_file_err, log_path) = create_engine_log("splash", entry, port)?;
+
+    let mut child = Command::new(&pack.python)
+        .arg("-I")
+        .arg("-B")
+        .arg("-u")
+        .arg("-m")
+        .arg("splash_engine")
+        .arg(&entry.path)
+        .arg("--no-webui")
+        .arg("--tokenizer")
+        .arg(entry.path.join("tokenizer"))
+        .arg("--model")
+        .arg(&entry.key)
+        .arg("--binary")
+        .arg(&pack.binary)
+        .arg("--host")
+        .arg("127.0.0.1")
+        .arg("--port")
+        .arg(port.to_string())
+        .arg("--max-memory")
+        .arg("auto")
+        .arg("--max-context")
+        .arg("auto")
+        .arg("--idle-release")
+        .arg("off")
+        .arg("--decode-share")
+        .arg("0")
+        .arg("--allow-idle-sleep")
+        .env("SPLASH_API_KEY", &api_key)
+        .env("HF_HUB_OFFLINE", "1")
+        .env("TRANSFORMERS_VERBOSITY", "error")
+        .env_remove("PYTHONHOME")
+        .env_remove("PYTHONPATH")
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log_file))
+        .stderr(Stdio::from(log_file_err))
+        .spawn()
+        .map_err(|e| {
+            load_error(
+                StatusCode::BAD_GATEWAY,
+                format!(
+                    "failed to spawn splash_engine ({}): {e}",
+                    pack.python.display()
+                ),
+            )
+        })?;
+    let pid = child.id().unwrap_or(0);
+
+    if !wait_for_splash_ready(state, &mut child, port, &api_key, SPLASH_READY_TIMEOUT).await {
+        terminate_child(&mut child).await;
+        return Err(load_error(
+            StatusCode::BAD_GATEWAY,
+            format!(
+                "splash_engine did not become ready on port {port}; log tail: {}",
+                log_tail(&log_path, 2000)
+            ),
+        ));
+    }
+
+    // The actualized context length, per the host's own
+    // handshake (GET /status → maximum_context_tokens).
+    let context_length = async {
+        let resp = state
+            .http
+            .get(format!("http://127.0.0.1:{port}/status"))
+            .header(header::AUTHORIZATION, format!("Bearer {api_key}"))
+            .send()
+            .await
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let value = resp.json::<serde_json::Value>().await.ok()?;
+        value
+            .get("maximum_context_tokens")
+            .and_then(|v| v.as_u64())
+            .and_then(|n| u32::try_from(n).ok())
+    }
+    .await;
+
+    Ok(register_instance(
+        state,
+        entry,
+        "splash",
+        port,
+        pid,
+        child,
+        log_path,
+        context_length,
+        Some(api_key),
+        libc::SIGINT,
+    )
+    .await)
 }
 
 #[derive(serde::Deserialize)]
@@ -982,9 +1203,9 @@ async fn load_model(
             format!("model not found in the library: {}", req.model),
         );
     };
-    // Format dispatch (GGUF / MLX / Splash-501) lives in
+    // Format dispatch (GGUF / MLX / Splash) lives in
     // spawn_instance; context_length and gpu_offload are GGUF-only
-    // knobs today and are ignored by the MLX spawner.
+    // knobs today and are ignored by the MLX and Splash spawners.
     let gpu_offload = req.gpu_offload.map(|v| v.round() as u32);
     let knobs = LoadKnobs {
         n_threads: req.n_threads,
@@ -1053,7 +1274,7 @@ async fn unload_model(
             format!("unknown instance: {}", req.instance_id),
         ),
         Some(mut loaded) => {
-            terminate_child(&mut loaded.child).await;
+            terminate_child_with(&mut loaded.child, loaded.stop_signal).await;
             log_line(&state, format!("unloaded {}", req.instance_id)).await;
             (
                 StatusCode::OK,
@@ -1705,11 +1926,13 @@ async fn chat_completions(State(state): State<Arc<AppState>>, body: axum::body::
         .and_then(|v| v.as_str())
         .map(str::to_owned);
 
-    // The proxy target: (base_url, model-id rewrite). Local
-    // instances forward the body untouched (rewrite `None`); a
-    // Maya target rewrites `model` to the provider's own id,
-    // since the client named our `maya/<provider>/<id>` key.
-    let mut target: Option<(String, Option<String>)> = None;
+    // The proxy target: (base_url, model-id rewrite, engine API
+    // key). Local instances forward the body untouched (rewrite
+    // `None`); a Maya target rewrites `model` to the provider's
+    // own id, since the client named our `maya/<provider>/<id>`
+    // key. The API key is the instance's per-load Bearer token
+    // (Splash pack), `None` for keyless engines and Maya.
+    let mut target: Option<(String, Option<String>, Option<String>)> = None;
 
     // 1. A loaded local instance: exact model match (full key or
     //    bare name).
@@ -1722,7 +1945,7 @@ async fn chat_completions(State(state): State<Arc<AppState>>, body: axum::body::
                     loaded.instance.model_key == *model
                         || loaded.instance.model_key.rsplit('/').next() == Some(model.as_str())
                 })
-                .map(|loaded| (loaded.base_url.clone(), None));
+                .map(|loaded| (loaded.base_url.clone(), None, loaded.api_key.clone()));
         }
     }
 
@@ -1733,7 +1956,7 @@ async fn chat_completions(State(state): State<Arc<AppState>>, body: axum::body::
     if target.is_none() {
         if let Some(model) = &requested {
             if let Some((base_url, model_id)) = resolve_maya_target(&state, model).await {
-                target = Some((base_url, Some(model_id)));
+                target = Some((base_url, Some(model_id), None));
             } else if model.starts_with("maya/") {
                 return error_response(
                     StatusCode::BAD_GATEWAY,
@@ -1752,15 +1975,14 @@ async fn chat_completions(State(state): State<Arc<AppState>>, body: axum::body::
             target = instances
                 .values()
                 .next()
-                .map(|loaded| (loaded.base_url.clone(), None));
+                .map(|loaded| (loaded.base_url.clone(), None, loaded.api_key.clone()));
         }
     }
 
     // 4. JIT: a requested, downloaded-but-unloaded local model
     //    loads on demand through the same format dispatch as
-    //    POST /api/v1/models/load (a Splash model surfaces the
-    //    dispatch's 501 here). Maya models never JIT — they are
-    //    already serving, and step 2 handled them. The Server
+    //    POST /api/v1/models/load. Maya models never JIT — they
+    //    are already serving, and step 2 handled them. The Server
     //    Settings JIT toggle gates this step.
     if target.is_none() {
         if let Some(model) = &requested {
@@ -1775,7 +1997,17 @@ async fn chat_completions(State(state): State<Arc<AppState>>, body: axum::body::
             if let Some(entry) = resolve_model(&state, model) {
                 match spawn_instance(&state, &entry, None, None, LoadKnobs::default()).await {
                     Ok(instance) => {
-                        target = Some((format!("http://127.0.0.1:{}", instance.port), None))
+                        let api_key = state
+                            .instances
+                            .read()
+                            .await
+                            .get(&instance.instance_id)
+                            .and_then(|loaded| loaded.api_key.clone());
+                        target = Some((
+                            format!("http://127.0.0.1:{}", instance.port),
+                            None,
+                            api_key,
+                        ))
                     }
                     Err((status, body)) => return (status, Json(body)).into_response(),
                 }
@@ -1783,7 +2015,7 @@ async fn chat_completions(State(state): State<Arc<AppState>>, body: axum::body::
         }
     }
 
-    let Some((base_url, rewrite)) = target else {
+    let Some((base_url, rewrite, api_key)) = target else {
         return error_response(
             StatusCode::BAD_REQUEST,
             "no loaded instance matches the requested model; load a model first",
@@ -1809,14 +2041,15 @@ async fn chat_completions(State(state): State<Arc<AppState>>, body: axum::body::
     };
 
     let upstream = format!("{}/v1/chat/completions", base_url.trim_end_matches('/'));
-    let resp = match state
+    let mut request = state
         .http
         .post(&upstream)
         .header(header::CONTENT_TYPE, "application/json")
-        .body(out_body)
-        .send()
-        .await
-    {
+        .body(out_body);
+    if let Some(key) = &api_key {
+        request = request.header(header::AUTHORIZATION, format!("Bearer {key}"));
+    }
+    let resp = match request.send().await {
         Ok(resp) => resp,
         Err(e) => {
             return error_response(
@@ -1960,7 +2193,7 @@ async fn main() {
             let _ = tokio::signal::ctrl_c().await;
             let mut instances = shutdown_state.instances.write().await;
             for (_, mut loaded) in instances.drain() {
-                terminate_child(&mut loaded.child).await;
+                terminate_child_with(&mut loaded.child, loaded.stop_signal).await;
             }
         })
         .await

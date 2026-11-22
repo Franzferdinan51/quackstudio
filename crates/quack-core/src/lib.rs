@@ -272,6 +272,99 @@ pub fn scan_packs(backends_dir: &Path) -> Vec<PackManifest> {
     packs
 }
 
+/// Lowercased file name of a path ("" when it has none).
+fn file_name_lower(p: &Path) -> String {
+    p.file_name()
+        .map(|n| n.to_string_lossy().to_lowercase())
+        .unwrap_or_default()
+}
+
+/// The main GGUF file of a GGUF model entry: the largest `.gguf`
+/// under the model directory whose name lacks "mmproj" (the same
+/// rule the scanner uses to recognise the model). `None` for
+/// non-GGUF entries or when no main file exists.
+pub fn main_gguf_path(entry: &ModelEntry) -> Option<PathBuf> {
+    if entry.format != ModelFormat::Gguf {
+        return None;
+    }
+    let mut files: Vec<(PathBuf, u64)> = Vec::new();
+    walk_files(&entry.path, &mut files);
+    files
+        .iter()
+        .filter(|(p, _)| {
+            let name = file_name_lower(p);
+            name.ends_with(".gguf") && !name.contains("mmproj")
+        })
+        .max_by_key(|(_, size)| *size)
+        .map(|(p, _)| p.clone())
+}
+
+// ---------------------------------------------------------------------------
+// Loaded instances
+// ---------------------------------------------------------------------------
+
+/// A running model instance, tracked by quackd's registry and
+/// reported inside each library entry's `loaded_instances`
+/// (LM Studio loads by instance, not by model).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Instance {
+    pub instance_id: String,
+    pub model_key: String,
+    /// Backend pack that loaded it, e.g. `"llama.cpp"`.
+    pub backend: String,
+    /// Loopback port the engine process serves on.
+    pub port: u16,
+    /// Engine process id.
+    pub pid: u32,
+}
+
+// ---------------------------------------------------------------------------
+// llama.cpp pack discovery
+// ---------------------------------------------------------------------------
+
+/// Parse the trailing `major.minor.patch` of a backend pack
+/// directory name (everything after the last `-`).
+fn parse_pack_version(dir_name: &str) -> Option<(u64, u64, u64)> {
+    let tail = dir_name.rsplit('-').next()?;
+    let mut parts = tail.split('.');
+    let version = (
+        parts.next()?.parse().ok()?,
+        parts.next()?.parse().ok()?,
+        parts.next()?.parse().ok()?,
+    );
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(version)
+}
+
+/// Find the `llama-server` binary of the newest llama.cpp backend
+/// pack under `backends_dir`. Pack directories are named like
+/// `llama.cpp-mac-arm64-apple-metal-advsimd-2.80.1` and sit side by
+/// side across versions; the highest trailing version wins.
+/// `None` when no pack ships a `llama-server` file.
+pub fn find_llama_server(backends_dir: &Path) -> Option<PathBuf> {
+    let read_dir = fs::read_dir(backends_dir).ok()?;
+    let mut best: Option<((u64, u64, u64), PathBuf)> = None;
+    for entry in read_dir.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.starts_with("llama.cpp-") {
+            continue;
+        }
+        let Some(version) = parse_pack_version(&name) else {
+            continue;
+        };
+        let server = entry.path().join("llama-server");
+        if !server.is_file() {
+            continue;
+        }
+        if best.as_ref().map_or(true, |(v, _)| version > *v) {
+            best = Some((version, server));
+        }
+    }
+    best.map(|(_, path)| path)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -405,6 +498,60 @@ mod tests {
         assert_eq!(packs[0].name, "llama.cpp");
         assert_eq!(packs[0].version, "2.80.1");
         assert_eq!(packs[0].formats, vec!["gguf".to_string()]);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn find_llama_server_picks_highest_version() {
+        let base = std::env::temp_dir().join(format!(
+            "quack-core-llama-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        for version in ["2.71.0", "2.80.1", "2.9.0"] {
+            let dir = base.join(format!(
+                "llama.cpp-mac-arm64-apple-metal-advsimd-{version}"
+            ));
+            fs::create_dir_all(&dir).unwrap();
+            write_bytes(&dir.join("llama-server"), 8);
+        }
+        // A newer-looking dir without the binary must not win, and
+        // unrelated packs are ignored.
+        let no_binary = base.join("llama.cpp-mac-arm64-apple-metal-advsimd-9.9.9");
+        fs::create_dir_all(&no_binary).unwrap();
+        let mlx_dir = base.join("mlx-llm-mac-arm64-1.14.0");
+        fs::create_dir_all(&mlx_dir).unwrap();
+        write_bytes(&mlx_dir.join("llama-server"), 8);
+
+        let found = find_llama_server(&base).expect("a llama-server");
+        assert!(
+            found.ends_with("llama.cpp-mac-arm64-apple-metal-advsimd-2.80.1/llama-server"),
+            "picked: {found:?}"
+        );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn main_gguf_path_skips_mmproj() {
+        let base = fixture();
+        let entries = scan_library(&base);
+        let gguf = entries
+            .iter()
+            .find(|e| e.format == ModelFormat::Gguf)
+            .unwrap();
+        let main = main_gguf_path(gguf).expect("main gguf");
+        assert!(main.ends_with("test-q4_k_m.gguf"), "picked: {main:?}");
+
+        let mlx = entries
+            .iter()
+            .find(|e| e.format == ModelFormat::Mlx)
+            .unwrap();
+        assert_eq!(main_gguf_path(mlx), None);
 
         let _ = fs::remove_dir_all(&base);
     }

@@ -12,5 +12,5 @@ path = "src/main.rs"
 [dependencies]
 quack-core = { path = "../quack-core" }
 clap = { version = "4", features = ["derive"] }
-ureq = "3"
+ureq = { version = "3", features = ["json"] }
 serde_json = "1"

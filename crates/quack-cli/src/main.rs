@@ -21,6 +21,16 @@ enum Commands {
     Ls,
     /// List currently loaded model instances.
     Ps,
+    /// Load a model (by publisher/name key or bare name) and print its instance id.
+    Load {
+        /// Model key (`publisher/name`) or bare model name.
+        model: String,
+    },
+    /// Unload a loaded instance by its instance id (see `quack ps`).
+    Unload {
+        /// Instance id, e.g. `publisher/model#1`.
+        instance_id: String,
+    },
     /// Server management.
     Server {
         #[command(subcommand)]
@@ -62,6 +72,71 @@ fn get_body(path: &str) -> Result<String, String> {
 fn get_models_json() -> Result<serde_json::Value, String> {
     let body = get_body("/api/v1/models")?;
     serde_json::from_str(&body).map_err(|e| format!("bad JSON from quackd: {e}"))
+}
+
+/// POST a JSON body to a daemon endpoint and return
+/// `(status, parsed body)`. HTTP error statuses are *not* treated
+/// as transport errors here — the daemon's `{"error": …}` body is
+/// the useful part, so callers decide what a status means.
+fn post_json(path: &str, payload: serde_json::Value) -> Result<(u16, serde_json::Value), String> {
+    let url = format!("{}{}", daemon_base(), path);
+    let config = ureq::config::Config::builder()
+        .http_status_as_error(false)
+        // A cold model load can take a while (daemon allows 180 s
+        // for the engine's health check alone).
+        .timeout_global(Some(std::time::Duration::from_secs(600)))
+        .build();
+    let agent = ureq::Agent::new_with_config(config);
+    let mut response = agent
+        .post(&url)
+        .send_json(payload)
+        .map_err(|e| unreachable(&url, &e))?;
+    let status = response.status().as_u16();
+    let text = response
+        .body_mut()
+        .read_to_string()
+        .map_err(|e| format!("failed reading response from {url}: {e}"))?;
+    let json = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
+    Ok((status, json))
+}
+
+/// Extract the daemon's `{"error": …}` message, if present.
+fn daemon_error(json: &serde_json::Value, status: u16) -> String {
+    json.get("error")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("request failed (HTTP {status})"))
+}
+
+fn cmd_load(model: &str) -> Result<(), String> {
+    let (status, json) = post_json(
+        "/api/v1/models/load",
+        serde_json::json!({ "model": model }),
+    )?;
+    if status != 200 {
+        return Err(daemon_error(&json, status));
+    }
+    let instance_id = json
+        .get("instance_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("?");
+    println!("loaded: {instance_id}");
+    if let Some(seconds) = json.get("load_time_seconds").and_then(|v| v.as_f64()) {
+        println!("load time: {seconds:.1}s");
+    }
+    Ok(())
+}
+
+fn cmd_unload(instance_id: &str) -> Result<(), String> {
+    let (status, json) = post_json(
+        "/api/v1/models/unload",
+        serde_json::json!({ "instance_id": instance_id }),
+    )?;
+    if status != 200 {
+        return Err(daemon_error(&json, status));
+    }
+    println!("unloaded: {instance_id}");
+    Ok(())
 }
 
 fn cmd_ls() -> Result<(), String> {
@@ -141,6 +216,8 @@ fn main() -> ExitCode {
     let result = match cli.command {
         Commands::Ls => cmd_ls(),
         Commands::Ps => cmd_ps(),
+        Commands::Load { model } => cmd_load(&model),
+        Commands::Unload { instance_id } => cmd_unload(&instance_id),
         Commands::Server { action } => match action {
             ServerAction::Status => cmd_server_status(),
         },

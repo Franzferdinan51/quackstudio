@@ -11,8 +11,9 @@ interface ChatMessage {
 type LoadPhase = "none" | "loading" | "ready" | "error";
 
 /** Chat page: model picker pill (loads through quackd's format
- *  dispatch — llama.cpp for GGUF, oMLX for MLX), streaming chat
- *  over the OpenAI-compat proxy. */
+ *  dispatch — llama.cpp for GGUF, oMLX for MLX; Maya models are
+ *  remote and always ready), streaming chat over the
+ *  OpenAI-compat proxy. */
 export default function Chat() {
   const [models, setModels] = useState<ModelEntry[]>([]);
   const [pickerOpen, setPickerOpen] = useState(false);
@@ -202,7 +203,10 @@ export default function Chat() {
                 <p className="px-4 py-3 text-muted">No models in the library.</p>
               )}
               {models.map((m) => {
-                const loadable = m.format === "gguf" || m.format === "mlx";
+                const loadable =
+                  m.format === "gguf" ||
+                  m.format === "mlx" ||
+                  m.format === "maya";
                 return (
                   <button
                     key={m.key}
@@ -214,7 +218,10 @@ export default function Chat() {
                     <span className="min-w-0 flex-1 truncate">
                       {m.display_name}
                       <span className="block truncate text-[11px] text-muted">
-                        {m.publisher} · {formatGB(m.size_bytes)}
+                        {m.format === "maya"
+                          ? (m.loaded_instances[0]?.backend ??
+                            "Maya · remote")
+                          : `${m.publisher} · ${formatGB(m.size_bytes)}`}
                       </span>
                     </span>
                     {m.loaded_instances.length > 0 && (
@@ -222,10 +229,16 @@ export default function Chat() {
                         loaded
                       </span>
                     )}
-                    <span className="rounded bg-panel-2 px-1.5 py-0.5 text-[10px] uppercase text-muted">
-                      {m.format}
-                      {!loadable && " · soon"}
-                    </span>
+                    {m.format === "maya" ? (
+                      <span className="rounded bg-primary/20 px-1.5 py-0.5 text-[10px] text-primary">
+                        Maya · remote
+                      </span>
+                    ) : (
+                      <span className="rounded bg-panel-2 px-1.5 py-0.5 text-[10px] uppercase text-muted">
+                        {m.format}
+                        {!loadable && " · soon"}
+                      </span>
+                    )}
                   </button>
                 );
               })}

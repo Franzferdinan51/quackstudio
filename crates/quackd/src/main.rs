@@ -1,11 +1,13 @@
 //! quackd — the QuackStudio daemon.
 //!
-//! P2 surface (see ../DESIGN.md):
-//!   GET  /api/v1/models          library index + loaded instances
+//! P3 surface (see ../DESIGN.md):
+//!   GET  /api/v1/models          library index + loaded instances,
+//!                                with Maya remote models merged in
 //!   GET  /api/v1/status          daemon status
 //!   POST /api/v1/models/load     spawn a backend engine for a model
 //!   POST /api/v1/models/unload   stop an instance by id
-//!   GET  /v1/models              OpenAI-compat list (loaded only)
+//!   GET  /v1/models              OpenAI-compat list (loaded only,
+//!                                plus Maya remote models)
 //!   POST /v1/chat/completions    proxy to the instance's engine (SSE passthrough)
 //!
 //! Loads dispatch on the model's format, mirroring LM Studio's
@@ -14,9 +16,17 @@
 //!                the backends dir, one child process per instance.
 //!   MLX        → oMLX pack: the newest oMLX build's Python running
 //!                `mlx_vlm.server`, one child per instance.
-//!   Splash     → 501 until the Splash/Strata pack lands in P3.
-//! Chat requests for a downloaded-but-unloaded model are JIT-loaded
-//! through the same dispatch, like LM Studio.
+//!   Splash     → 501 until the Splash/Strata pack lands.
+//!   Maya       → remote pack: Maya providers are OpenAI-compatible
+//!                servers of their own; their models are listed as
+//!                remote library entries (key `maya/<provider>/<id>`),
+//!                are "loaded" whenever the provider answers, and
+//!                chat proxies straight to the provider. No local
+//!                process, no local RAM. Load/unload stay honest:
+//!                load just verifies the provider serves the model,
+//!                unload refuses (Maya manages its own lifecycle).
+//! Chat requests for a downloaded-but-unloaded local model are
+//! JIT-loaded through the same dispatch, like LM Studio.
 //!
 //! Configuration via environment:
 //!   QUACK_PORT          listen port          (default 1234)
@@ -25,6 +35,9 @@
 //!   QUACK_LLAMA_SERVER  llama-server binary  (overrides pack discovery)
 //!   QUACK_MLX_PYTHON    MLX python           (overrides oMLX discovery;
 //!                        fallback ~/mlx-venv/bin/python)
+//!   QUACK_MAYA_PROVIDERS  Maya providers as comma-separated
+//!                        `name=url` pairs (default: Duckets' six
+//!                        per-provider endpoints on the Mac)
 
 use axum::{
     body::Body,
@@ -36,8 +49,8 @@ use axum::{
 };
 use futures_util::StreamExt;
 use quack_core::{
-    find_llama_server, find_omlx_python, main_gguf_path, scan_library, Instance, ModelEntry,
-    ModelFormat,
+    default_maya_providers, find_llama_server, find_omlx_python, main_gguf_path, scan_library,
+    Instance, MayaProvider, ModelEntry, ModelFormat,
 };
 use serde::Serialize;
 use std::collections::HashMap;
@@ -62,6 +75,10 @@ const MLX_HEALTH_TIMEOUT: Duration = Duration::from_secs(300);
 struct LoadedInstance {
     instance: Instance,
     child: Child,
+    /// Base URL the chat proxy posts to for this instance
+    /// (`http://127.0.0.1:<port>` for local engines; the Maya
+    /// resolution path builds the same shape for remote ones).
+    base_url: String,
     /// Per-instance engine log (stdout+stderr) under the temp dir;
     /// its tail is reported when a load fails.
     #[allow(dead_code)]
@@ -76,6 +93,8 @@ struct AppState {
     next_port: AtomicU16,
     next_instance: AtomicU64,
     http: reqwest::Client,
+    maya_providers: Vec<MayaProvider>,
+    maya_cache: RwLock<MayaCache>,
 }
 
 /// A library entry as served by `/api/v1/models`: the entry itself
@@ -100,12 +119,140 @@ fn error_body(message: String) -> serde_json::Value {
 }
 
 // ---------------------------------------------------------------------------
+// Maya pack (remote providers)
+// ---------------------------------------------------------------------------
+
+/// How long a provider's `/v1/models` result is reused before a
+/// refetch. Keeps the library listing snappy and avoids hammering
+/// Maya on every poll.
+const MAYA_CACHE_TTL: Duration = Duration::from_secs(30);
+/// Per-provider fetch budget: an unanswering provider must never
+/// stall the whole library listing.
+const MAYA_FETCH_TIMEOUT: Duration = Duration::from_millis(1500);
+
+/// One Maya provider's last-known state. `models: None` means the
+/// provider is not answering (offline, or not serving `/v1/models`)
+/// and contributes nothing until the next successful fetch.
+#[derive(Clone)]
+struct MayaProviderStatus {
+    name: String,
+    base_url: String,
+    port: u16,
+    models: Option<Vec<String>>,
+}
+
+#[derive(Default)]
+struct MayaCache {
+    fetched_at: Option<Instant>,
+    providers: Vec<MayaProviderStatus>,
+}
+
+/// The port a provider's base URL serves on (80 when the URL has
+/// no explicit port).
+fn provider_port(base_url: &str) -> u16 {
+    let after_scheme = base_url.split("://").nth(1).unwrap_or(base_url);
+    let host_port = after_scheme.split('/').next().unwrap_or("");
+    host_port
+        .rsplit(':')
+        .next()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(80)
+}
+
+/// Fetch one provider's model list. Any failure (unreachable,
+/// non-2xx, malformed body) yields `models: None` — never an
+/// error that could take down the whole listing.
+async fn fetch_provider_models(
+    http: &reqwest::Client,
+    provider: &MayaProvider,
+) -> MayaProviderStatus {
+    let mut status = MayaProviderStatus {
+        name: provider.name.clone(),
+        base_url: provider.base_url.clone(),
+        port: provider_port(&provider.base_url),
+        models: None,
+    };
+    let url = format!("{}/v1/models", provider.base_url.trim_end_matches('/'));
+    let fetched = async {
+        let resp = http
+            .get(&url)
+            .timeout(MAYA_FETCH_TIMEOUT)
+            .send()
+            .await
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let value: serde_json::Value = resp.json().await.ok()?;
+        let data = value.get("data")?.as_array()?;
+        let mut ids = Vec::new();
+        for item in data {
+            if let Some(id) = item.get("id").and_then(|v| v.as_str()) {
+                ids.push(id.to_string());
+            }
+        }
+        Some(ids)
+    }
+    .await;
+    status.models = fetched;
+    status
+}
+
+/// Current per-provider state, from the 30 s cache when fresh.
+async fn maya_snapshot(state: &Arc<AppState>) -> Vec<MayaProviderStatus> {
+    {
+        let cache = state.maya_cache.read().await;
+        if let Some(fetched_at) = cache.fetched_at {
+            if fetched_at.elapsed() < MAYA_CACHE_TTL {
+                return cache.providers.clone();
+            }
+        }
+    }
+    let fetches = state
+        .maya_providers
+        .iter()
+        .map(|provider| fetch_provider_models(&state.http, provider));
+    let providers: Vec<MayaProviderStatus> = futures_util::future::join_all(fetches).await;
+    let mut cache = state.maya_cache.write().await;
+    cache.fetched_at = Some(Instant::now());
+    cache.providers = providers.clone();
+    providers
+}
+
+/// A Maya model as a library entry: key `maya/<provider>/<id>`,
+/// always carrying one synthetic instance (the provider itself is
+/// the running engine — pid 0, there is no local process).
+fn maya_entry(status: &MayaProviderStatus, model_id: &str) -> ModelWithInstances {
+    let key = format!("maya/{}/{}", status.name, model_id);
+    ModelWithInstances {
+        entry: ModelEntry {
+            key: key.clone(),
+            publisher: "maya".to_string(),
+            display_name: model_id.to_string(),
+            format: ModelFormat::Maya,
+            size_bytes: 0,
+            path: PathBuf::new(),
+            arch: None,
+            vision: false,
+            remote_url: Some(status.base_url.clone()),
+        },
+        loaded_instances: vec![Instance {
+            instance_id: key.clone(),
+            model_key: key,
+            backend: format!("maya ({})", status.name),
+            port: status.port,
+            pid: 0,
+        }],
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Library / status
 // ---------------------------------------------------------------------------
 
 async fn list_models(State(state): State<Arc<AppState>>) -> Json<Vec<ModelWithInstances>> {
     let instances = state.instances.read().await;
-    let models = scan_library(&state.models_dir)
+    let mut models: Vec<ModelWithInstances> = scan_library(&state.models_dir)
         .into_iter()
         .map(|entry| ModelWithInstances {
             loaded_instances: instances
@@ -116,12 +263,24 @@ async fn list_models(State(state): State<Arc<AppState>>) -> Json<Vec<ModelWithIn
             entry,
         })
         .collect();
+    drop(instances);
+    // Maya pack: merge each answering provider's models as remote
+    // entries. An offline provider contributes nothing.
+    for status in maya_snapshot(&state).await {
+        if let Some(ids) = &status.models {
+            for id in ids {
+                models.push(maya_entry(&status, id));
+            }
+        }
+    }
     Json(models)
 }
 
 async fn status(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let model_count = scan_library(&state.models_dir).len();
     let loaded_count = state.instances.read().await.len();
+    let snapshot = maya_snapshot(&state).await;
+    let maya_online = snapshot.iter().filter(|s| s.models.is_some()).count();
     Json(serde_json::json!({
         "version": env!("CARGO_PKG_VERSION"),
         "port": state.port,
@@ -129,13 +288,16 @@ async fn status(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
         "backends_dir": state.backends_dir.to_string_lossy(),
         "model_count": model_count,
         "loaded_instances": loaded_count,
+        "maya_providers": state.maya_providers.len(),
+        "maya_providers_online": maya_online,
     }))
 }
 
 async fn openai_models(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    // OpenAI-compat lists *loaded* models only.
+    // OpenAI-compat lists *loaded* models only — local instances
+    // plus Maya remotes (loaded by definition when answering).
     let instances = state.instances.read().await;
-    let data: Vec<serde_json::Value> = instances
+    let mut data: Vec<serde_json::Value> = instances
         .values()
         .map(|loaded| {
             serde_json::json!({
@@ -146,6 +308,19 @@ async fn openai_models(State(state): State<Arc<AppState>>) -> Json<serde_json::V
             })
         })
         .collect();
+    drop(instances);
+    for status in maya_snapshot(&state).await {
+        if let Some(ids) = &status.models {
+            for id in ids {
+                data.push(serde_json::json!({
+                    "id": format!("maya/{}/{}", status.name, id),
+                    "object": "model",
+                    "created": 0,
+                    "owned_by": "maya",
+                }));
+            }
+        }
+    }
     Json(serde_json::json!({ "object": "list", "data": data }))
 }
 
@@ -284,6 +459,7 @@ async fn register_instance(
         LoadedInstance {
             instance: instance.clone(),
             child,
+            base_url: format!("http://127.0.0.1:{port}"),
             log_path,
         },
     );
@@ -292,8 +468,10 @@ async fn register_instance(
 
 /// Spawn the backend engine for a model, dispatching on format:
 /// GGUF → llama.cpp, MLX → oMLX (`mlx_vlm.server`), Splash → 501
-/// until the Splash/Strata pack lands in P3. On success the
-/// instance is registered and returned.
+/// until the Splash/Strata pack lands. On success the instance
+/// is registered and returned. Maya entries never reach here:
+/// they are not in the local library scan, and their loads are
+/// answered by `maya_load` before local resolution.
 async fn spawn_instance(
     state: &Arc<AppState>,
     entry: &ModelEntry,
@@ -306,6 +484,10 @@ async fn spawn_instance(
         ModelFormat::Splash => Err(load_error(
             StatusCode::NOT_IMPLEMENTED,
             "Splash/Strata pack lands in P3".to_string(),
+        )),
+        ModelFormat::Maya => Err(load_error(
+            StatusCode::BAD_REQUEST,
+            "Maya models are served by Maya and cannot be loaded locally".to_string(),
         )),
     }
 }
@@ -468,10 +650,59 @@ struct LoadRequest {
     gpu_offload: Option<f64>,
 }
 
+/// Load for a Maya key (`maya/<provider>/<model-id>`): there is
+/// nothing to spawn — the model is loaded exactly when its
+/// provider answers and lists it. 200 with the synthetic instance
+/// then; 502 when the provider is not answering; 404 when the
+/// provider is unknown or does not serve that model.
+async fn maya_load(state: &Arc<AppState>, key: &str, rest: &str) -> Response {
+    let Some((provider_name, model_id)) = rest.split_once('/') else {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            format!("malformed Maya model key: {key}"),
+        );
+    };
+    let snapshot = maya_snapshot(state).await;
+    let Some(provider) = snapshot.iter().find(|s| s.name == provider_name) else {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            format!("unknown Maya provider: {provider_name}"),
+        );
+    };
+    match &provider.models {
+        None => error_response(
+            StatusCode::BAD_GATEWAY,
+            format!(
+                "Maya provider {provider_name} ({}) is not answering",
+                provider.base_url
+            ),
+        ),
+        Some(models) if models.iter().any(|m| m == model_id) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "type": "llm",
+                "instance_id": key,
+                "status": "loaded",
+                "load_time_seconds": 0.0,
+            })),
+        )
+            .into_response(),
+        Some(_) => error_response(
+            StatusCode::NOT_FOUND,
+            format!("Maya provider {provider_name} does not serve {model_id}"),
+        ),
+    }
+}
+
 async fn load_model(
     State(state): State<Arc<AppState>>,
     Json(req): Json<LoadRequest>,
 ) -> Response {
+    // Maya pack: remote models have no local load; verify the
+    // provider serves the model instead.
+    if let Some(rest) = req.model.strip_prefix("maya/") {
+        return maya_load(&state, &req.model, rest).await;
+    }
     let Some(entry) = resolve_model(&state, &req.model) else {
         return error_response(
             StatusCode::NOT_FOUND,
@@ -507,6 +738,15 @@ async fn unload_model(
     State(state): State<Arc<AppState>>,
     Json(req): Json<UnloadRequest>,
 ) -> Response {
+    // Maya instances are synthetic — the model runs on Maya, not
+    // here, so there is nothing of ours to stop. Refuse honestly
+    // instead of faking an unload.
+    if req.instance_id.starts_with("maya/") {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "Maya models are managed by Maya — unload it there",
+        );
+    }
     let loaded = state.instances.write().await.remove(&req.instance_id);
     match loaded {
         None => error_response(
@@ -528,6 +768,35 @@ async fn unload_model(
 // Chat proxy
 // ---------------------------------------------------------------------------
 
+/// Resolve a chat request naming a Maya model — by full entry
+/// key (`maya/<provider>/<model-id>`) or by the provider's bare
+/// model id — to `(provider base_url, provider model id)`. The
+/// model id is what the request body's `model` field must carry
+/// for the provider. `None` when no answering provider serves it.
+async fn resolve_maya_target(
+    state: &Arc<AppState>,
+    requested: &str,
+) -> Option<(String, String)> {
+    let snapshot = maya_snapshot(state).await;
+    if let Some(rest) = requested.strip_prefix("maya/") {
+        let (provider_name, model_id) = rest.split_once('/')?;
+        let provider = snapshot.iter().find(|s| s.name == provider_name)?;
+        let models = provider.models.as_ref()?;
+        if models.iter().any(|m| m == model_id) {
+            return Some((provider.base_url.clone(), model_id.to_string()));
+        }
+        return None;
+    }
+    for provider in &snapshot {
+        if let Some(models) = &provider.models {
+            if models.iter().any(|m| m == requested) {
+                return Some((provider.base_url.clone(), requested.to_string()));
+            }
+        }
+    }
+    None
+}
+
 async fn chat_completions(State(state): State<Arc<AppState>>, body: axum::body::Bytes) -> Response {
     let parsed: serde_json::Value =
         serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
@@ -536,9 +805,14 @@ async fn chat_completions(State(state): State<Arc<AppState>>, body: axum::body::
         .and_then(|v| v.as_str())
         .map(str::to_owned);
 
-    // Pick a loaded instance: exact model match first (full key or
-    // bare name), then the sole instance when there is only one.
-    let mut target: Option<u16> = None;
+    // The proxy target: (base_url, model-id rewrite). Local
+    // instances forward the body untouched (rewrite `None`); a
+    // Maya target rewrites `model` to the provider's own id,
+    // since the client named our `maya/<provider>/<id>` key.
+    let mut target: Option<(String, Option<String>)> = None;
+
+    // 1. A loaded local instance: exact model match (full key or
+    //    bare name).
     {
         let instances = state.instances.read().await;
         if let Some(model) = &requested {
@@ -548,41 +822,80 @@ async fn chat_completions(State(state): State<Arc<AppState>>, body: axum::body::
                     loaded.instance.model_key == *model
                         || loaded.instance.model_key.rsplit('/').next() == Some(model.as_str())
                 })
-                .map(|loaded| loaded.instance.port);
-        }
-        if target.is_none() && instances.len() == 1 {
-            target = instances.values().next().map(|loaded| loaded.instance.port);
+                .map(|loaded| (loaded.base_url.clone(), None));
         }
     }
 
-    // JIT: a requested, downloaded-but-unloaded model loads on
-    // demand through the same format dispatch as
-    // POST /api/v1/models/load (a Splash model surfaces the
-    // dispatch's 501 here).
+    // 2. A Maya remote model (full key or bare provider model
+    //    id). A `maya/…` name that resolves nowhere is a hard
+    //    502: the client explicitly asked for a remote model
+    //    whose provider is offline or does not serve it.
+    if target.is_none() {
+        if let Some(model) = &requested {
+            if let Some((base_url, model_id)) = resolve_maya_target(&state, model).await {
+                target = Some((base_url, Some(model_id)));
+            } else if model.starts_with("maya/") {
+                return error_response(
+                    StatusCode::BAD_GATEWAY,
+                    format!(
+                        "Maya model {model} is unavailable: its provider is offline or does not serve it"
+                    ),
+                );
+            }
+        }
+    }
+
+    // 3. The sole loaded local instance, when there is only one.
+    if target.is_none() {
+        let instances = state.instances.read().await;
+        if instances.len() == 1 {
+            target = instances
+                .values()
+                .next()
+                .map(|loaded| (loaded.base_url.clone(), None));
+        }
+    }
+
+    // 4. JIT: a requested, downloaded-but-unloaded local model
+    //    loads on demand through the same format dispatch as
+    //    POST /api/v1/models/load (a Splash model surfaces the
+    //    dispatch's 501 here). Maya models never JIT — they are
+    //    already serving, and step 2 handled them.
     if target.is_none() {
         if let Some(model) = &requested {
             if let Some(entry) = resolve_model(&state, model) {
                 match spawn_instance(&state, &entry, None, None).await {
-                    Ok(instance) => target = Some(instance.port),
+                    Ok(instance) => {
+                        target = Some((format!("http://127.0.0.1:{}", instance.port), None))
+                    }
                     Err((status, body)) => return (status, Json(body)).into_response(),
                 }
             }
         }
     }
 
-    let Some(port) = target else {
+    let Some((base_url, rewrite)) = target else {
         return error_response(
             StatusCode::BAD_REQUEST,
             "no loaded instance matches the requested model; load a model first",
         );
     };
 
-    let upstream = format!("http://127.0.0.1:{port}/v1/chat/completions");
+    let out_body: Vec<u8> = match &rewrite {
+        Some(model_id) => {
+            let mut value = parsed.clone();
+            value["model"] = serde_json::Value::String(model_id.clone());
+            serde_json::to_vec(&value).unwrap_or_else(|_| body.to_vec())
+        }
+        None => body.to_vec(),
+    };
+
+    let upstream = format!("{}/v1/chat/completions", base_url.trim_end_matches('/'));
     let resp = match state
         .http
         .post(&upstream)
         .header(header::CONTENT_TYPE, "application/json")
-        .body(body.to_vec())
+        .body(out_body)
         .send()
         .await
     {
@@ -590,7 +903,7 @@ async fn chat_completions(State(state): State<Arc<AppState>>, body: axum::body::
         Err(e) => {
             return error_response(
                 StatusCode::BAD_GATEWAY,
-                format!("failed to reach llama-server on port {port}: {e}"),
+                format!("failed to reach the engine at {upstream}: {e}"),
             );
         }
     };
@@ -631,6 +944,30 @@ fn default_backends_dir() -> PathBuf {
         .join("backends")
 }
 
+/// Maya providers from `QUACK_MAYA_PROVIDERS` (comma-separated
+/// `name=url` pairs); unset or unparseable entries fall back to
+/// Duckets' defaults. Malformed pairs are skipped, not fatal.
+fn maya_providers_from_env() -> Vec<MayaProvider> {
+    match std::env::var("QUACK_MAYA_PROVIDERS") {
+        Ok(spec) => spec
+            .split(',')
+            .filter_map(|pair| {
+                let (name, url) = pair.trim().split_once('=')?;
+                let name = name.trim();
+                let url = url.trim().trim_end_matches('/');
+                if name.is_empty() || url.is_empty() {
+                    return None;
+                }
+                Some(MayaProvider {
+                    name: name.to_string(),
+                    base_url: url.to_string(),
+                })
+            })
+            .collect(),
+        Err(_) => default_maya_providers(),
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let port: u16 = std::env::var("QUACK_PORT")
@@ -652,6 +989,8 @@ async fn main() {
         next_port: AtomicU16::new(FIRST_ENGINE_PORT),
         next_instance: AtomicU64::new(0),
         http: reqwest::Client::new(),
+        maya_providers: maya_providers_from_env(),
+        maya_cache: RwLock::new(MayaCache::default()),
     });
     let app = Router::new()
         .route("/api/v1/models", get(list_models))

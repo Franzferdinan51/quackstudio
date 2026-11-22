@@ -150,11 +150,14 @@ fn cmd_ls() -> Result<(), String> {
     for m in &models {
         println!(
             "{:<48} {:<5} {:>8.2} GB",
-            format!("{}/{}", m.publisher, m.display_name),
+            // The entry key: `publisher/name` locally, and
+            // `maya/<provider>/<id>` for Maya remote models.
+            m.key,
             match m.format {
                 quack_core::ModelFormat::Gguf => "gguf",
                 quack_core::ModelFormat::Mlx => "mlx",
                 quack_core::ModelFormat::Splash => "splash",
+                quack_core::ModelFormat::Maya => "maya",
             },
             m.size_bytes as f64 / 1_000_000_000.0
         );

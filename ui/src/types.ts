@@ -12,11 +12,13 @@ export interface ModelEntry {
   key: string;
   publisher: string;
   display_name: string;
-  format: "gguf" | "mlx" | "splash";
+  format: "gguf" | "mlx" | "splash" | "maya";
   size_bytes: number;
   path: string;
   arch: string | null;
   vision: boolean;
+  /** Base URL of the serving provider for remote (Maya) models; null locally. */
+  remote_url: string | null;
   loaded_instances: LoadedInstance[];
 }
 

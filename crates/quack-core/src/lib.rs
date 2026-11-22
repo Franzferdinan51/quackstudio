@@ -13,15 +13,19 @@ use std::path::{Path, PathBuf};
 // Model library
 // ---------------------------------------------------------------------------
 
-/// On-disk model format, as QuackStudio understands it.
+/// Model format / serving kind, as QuackStudio understands it.
 /// Mirrors Duckets' backend preferences: GGUF → llama.cpp,
-/// safetensors (MLX) → oMLX, Splash → the Splash/Strata pack (P3).
+/// safetensors (MLX) → oMLX, Splash → the Splash/Strata pack.
+/// Maya is not an on-disk format: it marks a remote model served
+/// by a Maya provider (see [`MayaProvider`]) and merged into the
+/// library by quackd — zero local files, zero local RAM.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ModelFormat {
     Gguf,
     Mlx,
     Splash,
+    Maya,
 }
 
 /// One downloaded model in the library.
@@ -43,6 +47,9 @@ pub struct ModelEntry {
     /// True when the model ships a vision projector (GGUF `mmproj`)
     /// or declares a vision tower (MLX `vision_config`).
     pub vision: bool,
+    /// Base URL of the remote server when the model is served
+    /// remotely (Maya pack entries); `None` for local models.
+    pub remote_url: Option<String>,
 }
 
 /// Scan a two-level `publisher/model` models directory.
@@ -123,6 +130,7 @@ fn scan_model_dir(publisher: &str, name: &str, dir: &Path) -> Option<ModelEntry>
             path: dir.to_path_buf(),
             arch: None,
             vision: dir.join("vision").is_dir(),
+            remote_url: None,
         });
     }
 
@@ -146,6 +154,7 @@ fn scan_model_dir(publisher: &str, name: &str, dir: &Path) -> Option<ModelEntry>
             path: dir.to_path_buf(),
             arch: None,
             vision: has_mmproj,
+            remote_url: None,
         });
     }
 
@@ -176,6 +185,7 @@ fn scan_model_dir(publisher: &str, name: &str, dir: &Path) -> Option<ModelEntry>
             path: dir.to_path_buf(),
             arch,
             vision,
+            remote_url: None,
         });
     }
 
@@ -250,6 +260,16 @@ impl LoadConfig {
             },
             ModelFormat::Splash => LoadConfig {
                 context_length: Some(4096),
+                gpu_offload: None,
+                eval_batch_size: None,
+                physical_batch_size: None,
+                flash_attention: None,
+                num_experts: None,
+            },
+            // Remote models are loaded by Maya, not by us; the
+            // config is informational only.
+            ModelFormat::Maya => LoadConfig {
+                context_length: None,
                 gpu_offload: None,
                 eval_batch_size: None,
                 physical_batch_size: None,
@@ -347,6 +367,48 @@ pub struct Instance {
     pub port: u16,
     /// Engine process id.
     pub pid: u32,
+}
+
+// ---------------------------------------------------------------------------
+// Maya pack (remote backend)
+// ---------------------------------------------------------------------------
+
+/// A Maya provider: one of Duckets' Maya model servers. Each is an
+/// OpenAI-compatible HTTP server (its own port on the Mac); quackd
+/// lists its models as remote library entries and proxies chat to
+/// it, so a Maya model costs QuackStudio zero local processes and
+/// zero local RAM.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MayaProvider {
+    /// Short provider name, used in library keys:
+    /// `maya/<name>/<model-id>`.
+    pub name: String,
+    /// Base URL of the provider's OpenAI-compatible API,
+    /// e.g. `http://100.68.208.113:8085` (no trailing slash).
+    pub base_url: String,
+}
+
+/// Duckets' Maya providers on the Mac (tailnet address), one per
+/// model family. The front door on :8090 deliberately does not
+/// route every family (it does not route ik2), so the pack talks
+/// to the per-provider endpoints directly. `hy4` is often not
+/// running; quackd treats an unanswering provider as absent.
+pub fn default_maya_providers() -> Vec<MayaProvider> {
+    const HOST: &str = "100.68.208.113";
+    [
+        ("glm", 8080),
+        ("minimax", 8081),
+        ("qwen", 8082),
+        ("qwen-native", 8083),
+        ("hy4", 8084),
+        ("ik2", 8085),
+    ]
+    .into_iter()
+    .map(|(name, port)| MayaProvider {
+        name: name.to_string(),
+        base_url: format!("http://{HOST}:{port}"),
+    })
+    .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -544,6 +606,7 @@ mod tests {
             path: PathBuf::from("/tmp/m"),
             arch: None,
             vision: false,
+            remote_url: None,
         };
         let cfg = LoadConfig::default_for(&entry);
         let json = serde_json::to_value(&cfg).unwrap();
@@ -650,6 +713,21 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn default_maya_providers_are_the_six_mac_endpoints() {
+        let providers = default_maya_providers();
+        let names: Vec<&str> = providers.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["glm", "minimax", "qwen", "qwen-native", "hy4", "ik2"]
+        );
+        assert_eq!(providers[0].base_url, "http://100.68.208.113:8080");
+        assert_eq!(providers[5].base_url, "http://100.68.208.113:8085");
+        // The Maya format serializes lowercase, like the others.
+        let entry_format = serde_json::to_value(ModelFormat::Maya).unwrap();
+        assert_eq!(entry_format, "maya");
     }
 
     #[test]

@@ -14,6 +14,7 @@ const SAMPLE_ROWS: ModelEntry[] = [
     path: "",
     arch: "llama",
     vision: false,
+    remote_url: null,
     loaded_instances: [],
   },
   {
@@ -25,6 +26,7 @@ const SAMPLE_ROWS: ModelEntry[] = [
     path: "",
     arch: "Qwen2ForCausalLM",
     vision: true,
+    remote_url: null,
     loaded_instances: [],
   },
   {
@@ -36,7 +38,28 @@ const SAMPLE_ROWS: ModelEntry[] = [
     path: "",
     arch: null,
     vision: true,
+    remote_url: null,
     loaded_instances: [],
+  },
+  {
+    key: "maya/ik2/inkling-2-mini",
+    publisher: "maya",
+    display_name: "inkling-2-mini",
+    format: "maya",
+    size_bytes: 0,
+    path: "",
+    arch: null,
+    vision: false,
+    remote_url: "http://100.68.208.113:8085",
+    loaded_instances: [
+      {
+        instance_id: "maya/ik2/inkling-2-mini",
+        model_key: "maya/ik2/inkling-2-mini",
+        backend: "maya (ik2)",
+        port: 8085,
+        pid: 0,
+      },
+    ],
   },
 ];
 
@@ -232,17 +255,24 @@ export default function Library() {
                         vision
                       </span>
                     )}
+                    {m.format === "maya" && (
+                      <span className="ml-2 rounded bg-primary/20 px-1.5 py-0.5 text-[10px] text-primary">
+                        Remote · Maya
+                      </span>
+                    )}
                     {m.loaded_instances.length > 0 && (
                       <span className="ml-2 rounded bg-accent/20 px-1.5 py-0.5 text-[10px] text-accent">
                         loaded
                       </span>
                     )}
                   </td>
-                  <td className="px-4 py-2.5 text-muted">Local</td>
+                  <td className="px-4 py-2.5 text-muted">
+                    {m.format === "maya" ? "Remote" : "Local"}
+                  </td>
                   <td className="px-4 py-2.5 text-muted">{m.arch ?? "—"}</td>
                   <td className="px-4 py-2.5 text-muted">—</td>
                   <td className="px-4 py-2.5 text-muted">
-                    {formatGB(m.size_bytes)}
+                    {m.format === "maya" ? "—" : formatGB(m.size_bytes)}
                   </td>
                   <td className="px-4 py-2.5 text-muted">{m.publisher}</td>
                   <td className="px-4 py-2.5">
@@ -343,7 +373,12 @@ export default function Library() {
               {[
                 ["Format", selected.format.toUpperCase()],
                 ["Arch", selected.arch ?? "—"],
-                ["Size", formatGB(selected.size_bytes)],
+                [
+                  "Size",
+                  selected.format === "maya"
+                    ? "—"
+                    : formatGB(selected.size_bytes),
+                ],
                 ["Vision", selected.vision ? "Yes" : "No"],
                 ["Publisher", selected.publisher],
                 ["Key", selected.key],
@@ -353,16 +388,36 @@ export default function Library() {
                   <dd className="min-w-0 break-words">{value}</dd>
                 </div>
               ))}
-              <div className="flex items-baseline gap-3">
-                <dt className="w-20 shrink-0 text-muted">Path</dt>
-                <dd className="min-w-0 text-[12px] break-all text-muted">
-                  {selected.path || "—"}
-                </dd>
-              </div>
+              {selected.remote_url ? (
+                <div className="flex items-baseline gap-3">
+                  <dt className="w-20 shrink-0 text-muted">Endpoint</dt>
+                  <dd className="min-w-0 text-[12px] break-all text-muted">
+                    {selected.remote_url}
+                  </dd>
+                </div>
+              ) : (
+                <div className="flex items-baseline gap-3">
+                  <dt className="w-20 shrink-0 text-muted">Path</dt>
+                  <dd className="min-w-0 text-[12px] break-all text-muted">
+                    {selected.path || "—"}
+                  </dd>
+                </div>
+              )}
             </dl>
           )}
 
-          {tab === "load" && (
+          {tab === "load" && selected.format === "maya" && (
+            <div className="mt-4 flex flex-col gap-5">
+              <p className="rounded-xl border border-edge bg-panel-2 px-3.5 py-3 text-[12px] text-muted">
+                Served by Maya at {selected.remote_url} — nothing to
+                load locally; pick it in Chat. Maya manages this
+                model's lifecycle, so there are no load or unload
+                controls here.
+              </p>
+            </div>
+          )}
+
+          {tab === "load" && selected.format !== "maya" && (
             <div className="mt-4 flex flex-col gap-5">
               {selected.loaded_instances.map((inst) => (
                 <div

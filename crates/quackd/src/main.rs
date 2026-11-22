@@ -62,7 +62,7 @@ use quack_core::{
     Instance, MayaProvider, ModelEntry, ModelFormat,
 };
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -93,6 +93,13 @@ struct LoadedInstance {
     /// its tail is reported when a load fails.
     #[allow(dead_code)]
     log_path: PathBuf,
+    /// Size of the model's files on disk — the honest proxy for
+    /// the memory a loaded instance holds (weights are mmap'd /
+    /// loaded whole by both engines we drive).
+    size_bytes: u64,
+    /// Context length the instance was loaded with, when the
+    /// caller specified one (llama.cpp only today).
+    context_length: Option<u32>,
 }
 
 struct AppState {
@@ -114,6 +121,28 @@ struct AppState {
     /// In-flight and finished download jobs, by job id
     /// (`<repo>/<filename>`).
     downloads: RwLock<HashMap<String, Arc<RwLock<DownloadJob>>>>,
+    /// Ring buffer of the daemon's own recent log lines (newest
+    /// last), served at GET /api/v1/logs for the Model Server
+    /// page's Server Logs strip.
+    logs: RwLock<VecDeque<String>>,
+    /// Persisted non-provider settings (server behaviour, general
+    /// flags, model defaults) — the rest of settings.json beside
+    /// the Maya provider list.
+    persisted: RwLock<PersistedSettings>,
+}
+
+/// How many daemon log lines the ring buffer keeps.
+const LOG_CAP: usize = 200;
+
+/// Append one line to the daemon log ring buffer (and echo it to
+/// stdout, like the startup line always has).
+async fn log_line(state: &Arc<AppState>, line: String) {
+    println!("{line}");
+    let mut logs = state.logs.write().await;
+    if logs.len() >= LOG_CAP {
+        logs.pop_front();
+    }
+    logs.push_back(line);
 }
 
 /// A library entry as served by `/api/v1/models`: the entry itself
@@ -135,6 +164,153 @@ fn error_response(status: StatusCode, message: impl Into<String>) -> Response {
 
 fn error_body(message: String) -> serde_json::Value {
     serde_json::json!({ "error": message })
+}
+
+// ---------------------------------------------------------------------------
+// Host facts (for /api/v1/status — the sidebar pills, LM Link page
+// and Settings → Hardware all read these)
+// ---------------------------------------------------------------------------
+
+/// Read a string sysctl by name (macOS). `None` off macOS or on
+/// any failure — callers substitute an honest placeholder.
+#[cfg(target_os = "macos")]
+fn sysctl_string(name: &str) -> Option<String> {
+    let cname = std::ffi::CString::new(name).ok()?;
+    let mut buf = vec![0u8; 256];
+    let mut len = buf.len();
+    // SAFETY: sysctlbyname with a valid name, a buffer of `len`
+    // bytes, and no new value. Standard read-only query.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            cname.as_ptr(),
+            buf.as_mut_ptr() as *mut libc::c_void,
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 || len == 0 {
+        return None;
+    }
+    buf.truncate(len);
+    if buf.last() == Some(&0) {
+        buf.pop();
+    }
+    Some(String::from_utf8_lossy(&buf).into_owned())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn sysctl_string(_name: &str) -> Option<String> {
+    None
+}
+
+/// Read a u64 sysctl by name (macOS `hw.memsize`).
+#[cfg(target_os = "macos")]
+fn sysctl_u64(name: &str) -> Option<u64> {
+    let cname = std::ffi::CString::new(name).ok()?;
+    let mut value: u64 = 0;
+    let mut len = std::mem::size_of::<u64>();
+    // SAFETY: as above; the output slot is exactly one u64.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            cname.as_ptr(),
+            &mut value as *mut u64 as *mut libc::c_void,
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    Some(value)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn sysctl_u64(_name: &str) -> Option<u64> {
+    None
+}
+
+/// This machine's hostname (`gethostname`), for the LM Link
+/// "This device" card.
+fn host_name() -> String {
+    let mut buf = vec![0u8; 256];
+    // SAFETY: gethostname writes at most `len` bytes into buf.
+    let rc = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
+    if rc != 0 {
+        return "unknown".to_string();
+    }
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    String::from_utf8_lossy(&buf[..end]).into_owned()
+}
+
+/// The daemon process's own peak RSS (`getrusage` ru_maxrss —
+/// bytes on macOS). Peak, not current: getrusage offers nothing
+/// else, and the field name in /api/v1/status says so.
+fn daemon_peak_rss_bytes() -> u64 {
+    // SAFETY: getrusage fills the struct; RUSAGE_SELF is valid.
+    unsafe {
+        let mut usage: libc::rusage = std::mem::zeroed();
+        if libc::getrusage(libc::RUSAGE_SELF, &mut usage) != 0 {
+            return 0;
+        }
+        if usage.ru_maxrss < 0 {
+            0
+        } else if cfg!(target_os = "macos") {
+            usage.ru_maxrss as u64
+        } else {
+            // Linux reports ru_maxrss in KiB.
+            (usage.ru_maxrss as u64) * 1024
+        }
+    }
+}
+
+/// The host block of GET /api/v1/status.
+fn host_info() -> serde_json::Value {
+    serde_json::json!({
+        "name": host_name(),
+        "chip": sysctl_string("machdep.cpu.brand_string").unwrap_or_else(|| "unknown".to_string()),
+        "gpu": "Apple Silicon (Metal)",
+        "total_ram_bytes": sysctl_u64("hw.memsize").unwrap_or(0),
+        "daemon_rss_bytes": daemon_peak_rss_bytes(),
+        // No honest per-process CPU% without sampling state; the
+        // UI shows the daemon RSS in the second pill instead.
+        "cpu_percent": null,
+    })
+}
+
+/// The packs block of GET /api/v1/status: what quackd found on
+/// disk, in the shape Settings → Runtime renders.
+fn packs_info(state: &AppState) -> serde_json::Value {
+    let llama = match llama_server_binary(state) {
+        Some(path) => path
+            .parent()
+            .and_then(|dir| dir.file_name())
+            .map(|name| {
+                name.to_string_lossy()
+                    .rsplit('-')
+                    .next()
+                    .unwrap_or("")
+                    .to_string()
+            })
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| "found".to_string()),
+        None => "not found".to_string(),
+    };
+    let mlx = match mlx_python(state) {
+        Some(path) => path
+            .parent()
+            .and_then(|bin| bin.parent())
+            .and_then(|dir| dir.file_name())
+            .map(|name| format!("omlx ({})", name.to_string_lossy()))
+            .unwrap_or_else(|| "omlx".to_string()),
+        None => "not found".to_string(),
+    };
+    serde_json::json!({
+        "llama": llama,
+        "mlx": mlx,
+        "splash": "not bundled",
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -297,9 +473,30 @@ async fn list_models(State(state): State<Arc<AppState>>) -> Json<Vec<ModelWithIn
 
 async fn status(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let model_count = scan_library(&state.models_dir).len();
-    let loaded_count = state.instances.read().await.len();
+    let instances = state.instances.read().await;
+    let loaded_count = instances.len();
+    // Sum of the loaded models' on-disk sizes: the honest proxy
+    // for loaded weight memory (both engines load weights whole).
+    let loaded_bytes: u64 = instances.values().map(|l| l.size_bytes).sum();
+    let instance_list: Vec<serde_json::Value> = instances
+        .values()
+        .map(|l| {
+            serde_json::json!({
+                "instance_id": l.instance.instance_id,
+                "model_key": l.instance.model_key,
+                "backend": l.instance.backend,
+                "port": l.instance.port,
+                "pid": l.instance.pid,
+                "context_length": l.context_length,
+                "size_bytes": l.size_bytes,
+            })
+        })
+        .collect();
+    drop(instances);
     let snapshot = maya_snapshot(&state).await;
     let maya_online = snapshot.iter().filter(|s| s.models.is_some()).count();
+    let mut host = host_info();
+    host["loaded_bytes"] = serde_json::json!(loaded_bytes);
     Json(serde_json::json!({
         "version": env!("CARGO_PKG_VERSION"),
         "port": state.port,
@@ -307,9 +504,19 @@ async fn status(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
         "backends_dir": state.backends_dir.to_string_lossy(),
         "model_count": model_count,
         "loaded_instances": loaded_count,
+        "instances": instance_list,
         "maya_providers": state.maya_providers.read().await.len(),
         "maya_providers_online": maya_online,
+        "host": host,
+        "packs": packs_info(&state),
     }))
+}
+
+/// GET /api/v1/logs — the daemon's recent log lines (ring buffer,
+/// oldest first), for the Model Server page's Server Logs strip.
+async fn get_logs(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let logs = state.logs.read().await;
+    Json(serde_json::json!({ "lines": logs.iter().collect::<Vec<_>>() }))
 }
 
 async fn openai_models(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
@@ -464,6 +671,7 @@ async fn register_instance(
     pid: u32,
     child: Child,
     log_path: PathBuf,
+    context_length: Option<u32>,
 ) -> Instance {
     let n = state.next_instance.fetch_add(1, Ordering::SeqCst) + 1;
     let instance = Instance {
@@ -480,6 +688,8 @@ async fn register_instance(
             child,
             base_url: format!("http://127.0.0.1:{port}"),
             log_path,
+            size_bytes: entry.size_bytes,
+            context_length,
         },
     );
     instance
@@ -491,14 +701,30 @@ async fn register_instance(
 /// is registered and returned. Maya entries never reach here:
 /// they are not in the local library scan, and their loads are
 /// answered by `maya_load` before local resolution.
+/// Advanced llama.cpp load knobs from the Library Load tab.
+/// Each maps to one llama-server flag when present; the MLX
+/// spawner ignores them (mlx_vlm.server has no equivalents).
+#[derive(Default, Clone, Copy)]
+struct LoadKnobs {
+    /// `-t` — CPU thread pool size.
+    n_threads: Option<u32>,
+    /// `-b` — evaluation (logical) batch size.
+    eval_batch_size: Option<u32>,
+    /// `-ub` — physical batch size.
+    physical_batch_size: Option<u32>,
+}
+
 async fn spawn_instance(
     state: &Arc<AppState>,
     entry: &ModelEntry,
     context_length: Option<u32>,
     gpu_offload: Option<u32>,
+    knobs: LoadKnobs,
 ) -> Result<Instance, LoadError> {
     match entry.format {
-        ModelFormat::Gguf => spawn_llama_instance(state, entry, context_length, gpu_offload).await,
+        ModelFormat::Gguf => {
+            spawn_llama_instance(state, entry, context_length, gpu_offload, knobs).await
+        }
         ModelFormat::Mlx => spawn_mlx_instance(state, entry).await,
         ModelFormat::Splash => Err(load_error(
             StatusCode::NOT_IMPLEMENTED,
@@ -517,6 +743,7 @@ async fn spawn_llama_instance(
     entry: &ModelEntry,
     context_length: Option<u32>,
     gpu_offload: Option<u32>,
+    knobs: LoadKnobs,
 ) -> Result<Instance, LoadError> {
     let server = llama_server_binary(state).ok_or_else(|| {
         load_error(
@@ -537,8 +764,8 @@ async fn spawn_llama_instance(
     let port = state.next_port.fetch_add(1, Ordering::SeqCst);
     let (log_file, log_file_err, log_path) = create_engine_log("llama", entry, port)?;
 
-    let mut child = Command::new(&server)
-        .arg("--model")
+    let mut cmd = Command::new(&server);
+    cmd.arg("--model")
         .arg(&model_path)
         .arg("--host")
         .arg("127.0.0.1")
@@ -548,7 +775,19 @@ async fn spawn_llama_instance(
         .arg(context_length.unwrap_or(8192).to_string())
         .arg("--n-gpu-layers")
         .arg(gpu_offload.unwrap_or(999).to_string())
-        .arg("--jinja")
+        .arg("--jinja");
+    // Advanced knobs (Library Load tab) — only when the caller
+    // set them, so llama-server's own defaults rule otherwise.
+    if let Some(n) = knobs.n_threads {
+        cmd.arg("-t").arg(n.to_string());
+    }
+    if let Some(n) = knobs.eval_batch_size {
+        cmd.arg("-b").arg(n.to_string());
+    }
+    if let Some(n) = knobs.physical_batch_size {
+        cmd.arg("-ub").arg(n.to_string());
+    }
+    let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::from(log_file))
         .stderr(Stdio::from(log_file_err))
@@ -572,7 +811,17 @@ async fn spawn_llama_instance(
         ));
     }
 
-    Ok(register_instance(state, entry, "llama.cpp", port, pid, child, log_path).await)
+    Ok(register_instance(
+        state,
+        entry,
+        "llama.cpp",
+        port,
+        pid,
+        child,
+        log_path,
+        context_length,
+    )
+    .await)
 }
 
 /// The MLX interpreter: `QUACK_MLX_PYTHON` override first, then
@@ -657,7 +906,7 @@ async fn spawn_mlx_instance(
         ));
     }
 
-    Ok(register_instance(state, entry, "mlx (omlx)", port, pid, child, log_path).await)
+    Ok(register_instance(state, entry, "mlx (omlx)", port, pid, child, log_path, None).await)
 }
 
 #[derive(serde::Deserialize)]
@@ -667,6 +916,11 @@ struct LoadRequest {
     /// Passed to llama-server as `--n-gpu-layers` (default 999 =
     /// offload everything, LM Studio's Metal behaviour).
     gpu_offload: Option<f64>,
+    /// Advanced llama.cpp knobs (Library Load tab's Advanced
+    /// section): `-t`, `-b`, `-ub`. Ignored for MLX loads.
+    n_threads: Option<u32>,
+    eval_batch_size: Option<u32>,
+    physical_batch_size: Option<u32>,
 }
 
 /// Load for a Maya key (`maya/<provider>/<model-id>`): there is
@@ -732,19 +986,45 @@ async fn load_model(
     // spawn_instance; context_length and gpu_offload are GGUF-only
     // knobs today and are ignored by the MLX spawner.
     let gpu_offload = req.gpu_offload.map(|v| v.round() as u32);
+    let knobs = LoadKnobs {
+        n_threads: req.n_threads,
+        eval_batch_size: req.eval_batch_size,
+        physical_batch_size: req.physical_batch_size,
+    };
     let started = Instant::now();
-    match spawn_instance(&state, &entry, req.context_length, gpu_offload).await {
-        Ok(instance) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "type": "llm",
-                "instance_id": instance.instance_id,
-                "status": "loaded",
-                "load_time_seconds": started.elapsed().as_secs_f64(),
-            })),
-        )
-            .into_response(),
-        Err((status, body)) => (status, Json(body)).into_response(),
+    match spawn_instance(&state, &entry, req.context_length, gpu_offload, knobs).await {
+        Ok(instance) => {
+            log_line(
+                &state,
+                format!(
+                    "loaded {} as {} ({}) in {:.1}s",
+                    entry.key,
+                    instance.instance_id,
+                    instance.backend,
+                    started.elapsed().as_secs_f64()
+                ),
+            )
+            .await;
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "type": "llm",
+                    "instance_id": instance.instance_id,
+                    "status": "loaded",
+                    "load_time_seconds": started.elapsed().as_secs_f64(),
+                })),
+            )
+                .into_response()
+        }
+        Err((status, body)) => {
+            let message = body
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("load failed")
+                .to_string();
+            log_line(&state, format!("load failed for {}: {message}", entry.key)).await;
+            (status, Json(body)).into_response()
+        }
     }
 }
 
@@ -774,6 +1054,7 @@ async fn unload_model(
         ),
         Some(mut loaded) => {
             terminate_child(&mut loaded.child).await;
+            log_line(&state, format!("unloaded {}", req.instance_id)).await;
             (
                 StatusCode::OK,
                 Json(serde_json::json!({ "status": "unloaded" })),
@@ -1020,7 +1301,8 @@ async fn start_download(
         status: "downloading".to_string(),
         error: None,
     }));
-    state.downloads.write().await.insert(id, job.clone());
+    state.downloads.write().await.insert(id.clone(), job.clone());
+    log_line(&state, format!("download started: {id}")).await;
     tokio::spawn(run_download(state.clone(), job.clone()));
     let snapshot = job.read().await.clone();
     Json(snapshot).into_response()
@@ -1034,6 +1316,7 @@ async fn run_download(state: Arc<AppState>, job: Arc<RwLock<DownloadJob>>) {
         let job = job.read().await;
         (job.repo.clone(), job.filename.clone())
     };
+    let id = format!("{repo}/{filename}");
     match download_file(&state, &job, &repo, &filename).await {
         Ok(()) => {
             let mut job = job.write().await;
@@ -1041,11 +1324,15 @@ async fn run_download(state: Arc<AppState>, job: Arc<RwLock<DownloadJob>>) {
             if job.bytes_total.is_none() {
                 job.bytes_total = Some(job.bytes_done);
             }
+            drop(job);
+            log_line(&state, format!("download finished: {id}")).await;
         }
         Err(message) => {
             let mut job = job.write().await;
             job.status = "error".to_string();
-            job.error = Some(message);
+            job.error = Some(message.clone());
+            drop(job);
+            log_line(&state, format!("download failed: {id}: {message}")).await;
         }
     }
 }
@@ -1116,12 +1403,75 @@ async fn list_downloads(State(state): State<Arc<AppState>>) -> Json<Vec<Download
 // Settings
 // ---------------------------------------------------------------------------
 
-/// On-disk settings (`<settings_dir>/settings.json`). Only the
-/// Maya provider list is persisted today — it is the settings
-/// surface the Settings page can edit.
-#[derive(Serialize, serde::Deserialize)]
+/// Server behaviour knobs (Model Server page's Server Settings
+/// popover + Settings → Developer). Stored in settings.json.
+/// Of these, only `jit` is enforced today (it gates the chat
+/// proxy's just-in-time load); the rest are recorded preferences
+/// the daemon does not yet act on — auth/CORS are handled by the
+/// permissive local-only listener, and idle-TTL eviction is not
+/// implemented. The UI labels them as stored settings.
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+#[serde(default)]
+struct ServerSettings {
+    require_auth: bool,
+    serve_lan: bool,
+    cors: bool,
+    jit: bool,
+    jit_ttl_minutes: u32,
+    jit_only_last: bool,
+}
+
+impl Default for ServerSettings {
+    fn default() -> Self {
+        ServerSettings {
+            require_auth: false,
+            serve_lan: true,
+            cors: true,
+            jit: true,
+            jit_ttl_minutes: 10,
+            jit_only_last: false,
+        }
+    }
+}
+
+/// General app flags stored in settings.json.
+#[derive(Debug, Clone, Default, Serialize, serde::Deserialize)]
+#[serde(default)]
+struct GeneralSettings {
+    /// Use LM Studio's Hugging Face proxy for Discover/downloads.
+    /// Stored only — quackd talks to huggingface.co directly.
+    hf_proxy: bool,
+}
+
+/// Model defaults stored in settings.json. `context_length` is
+/// wired: it seeds the Library Load tab's initial value.
+#[derive(Debug, Clone, Default, Serialize, serde::Deserialize)]
+#[serde(default)]
+struct ModelDefaults {
+    context_length: Option<u32>,
+    image_max_px: Option<u32>,
+}
+
+/// The persisted settings beside the Maya provider list.
+#[derive(Debug, Clone, Default)]
+struct PersistedSettings {
+    server: ServerSettings,
+    general: GeneralSettings,
+    defaults: ModelDefaults,
+}
+
+/// On-disk settings (`<settings_dir>/settings.json`). Every
+/// field defaults so files written by older builds still parse.
+#[derive(Serialize, serde::Deserialize, Default)]
 struct SettingsFile {
+    #[serde(default)]
     maya_providers: Vec<MayaProvider>,
+    #[serde(default)]
+    server: ServerSettings,
+    #[serde(default)]
+    general: GeneralSettings,
+    #[serde(default)]
+    defaults: ModelDefaults,
 }
 
 /// The settings directory: `QUACK_SETTINGS_DIR`, else
@@ -1135,12 +1485,28 @@ fn settings_dir() -> PathBuf {
     home_dir().join(".quackstudio")
 }
 
-/// Providers persisted in the settings file, when it exists and
-/// parses. Entries were validated on save; a hand-corrupted file
-/// simply falls back to the defaults.
-fn read_settings_providers(dir: &Path) -> Option<Vec<MayaProvider>> {
+/// The whole settings file, when it exists and parses. Entries
+/// were validated on save; a hand-corrupted file simply falls
+/// back to the defaults.
+fn read_settings_file(dir: &Path) -> Option<SettingsFile> {
     let text = std::fs::read_to_string(dir.join("settings.json")).ok()?;
-    let file: SettingsFile = serde_json::from_str(&text).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// Providers persisted in the settings file. `Some` only when
+/// the file exists and actually carries a provider list, so a
+/// file written for other settings doesn't clobber the defaults
+/// with an empty list.
+fn read_settings_providers(dir: &Path) -> Option<Vec<MayaProvider>> {
+    let file = read_settings_file(dir)?;
+    if file.maya_providers.is_empty() {
+        // Distinguish "no file" from "file with an empty list":
+        // the raw text tells us whether the key was present.
+        let text = std::fs::read_to_string(dir.join("settings.json")).ok()?;
+        if !text.contains("maya_providers") {
+            return None;
+        }
+    }
     Some(file.maya_providers)
 }
 
@@ -1156,10 +1522,23 @@ fn resolve_maya_providers(dir: &Path) -> (Vec<MayaProvider>, &'static str) {
     (default_maya_providers(), "default")
 }
 
+/// The non-provider persisted settings at startup.
+fn resolve_persisted(dir: &Path) -> PersistedSettings {
+    match read_settings_file(dir) {
+        Some(file) => PersistedSettings {
+            server: file.server,
+            general: file.general,
+            defaults: file.defaults,
+        },
+        None => PersistedSettings::default(),
+    }
+}
+
 /// The settings view both settings endpoints answer with.
 async fn settings_view(state: &Arc<AppState>) -> serde_json::Value {
     let providers = state.maya_providers.read().await.clone();
     let source = *state.maya_source.read().await;
+    let persisted = state.persisted.read().await.clone();
     serde_json::json!({
         "version": env!("CARGO_PKG_VERSION"),
         "port": state.port,
@@ -1167,6 +1546,9 @@ async fn settings_view(state: &Arc<AppState>) -> serde_json::Value {
         "backends_dir": state.backends_dir.to_string_lossy(),
         "maya_providers": providers,
         "maya_providers_source": source,
+        "server": persisted.server,
+        "general": persisted.general,
+        "defaults": persisted.defaults,
     })
 }
 
@@ -1175,54 +1557,75 @@ async fn get_settings(State(state): State<Arc<AppState>>) -> Json<serde_json::Va
     Json(settings_view(&state).await)
 }
 
+/// POST /api/v1/settings body: every section is optional; the
+/// ones present are validated, persisted, and applied.
 #[derive(serde::Deserialize)]
 struct SettingsRequest {
-    maya_providers: Vec<MayaProvider>,
+    maya_providers: Option<Vec<MayaProvider>>,
+    server: Option<ServerSettings>,
+    general: Option<GeneralSettings>,
+    defaults: Option<ModelDefaults>,
 }
 
-/// POST /api/v1/settings — validate, persist, and apply a new
-/// Maya provider list. The file is written before the live list
-/// swaps, so a failed write can never desync memory from storage.
+/// POST /api/v1/settings — validate, persist, and apply the
+/// provided settings sections. The file is written before the
+/// live state swaps, so a failed write can never desync memory
+/// from storage.
 async fn update_settings(
     State(state): State<Arc<AppState>>,
     Json(req): Json<SettingsRequest>,
 ) -> Response {
-    let mut providers: Vec<MayaProvider> = Vec::with_capacity(req.maya_providers.len());
-    for provider in &req.maya_providers {
-        let name = provider.name.trim();
-        let base_url = provider.base_url.trim().trim_end_matches('/');
-        if name.is_empty() {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                "provider names must not be empty",
-            );
-        }
-        let parsed = match reqwest::Url::parse(base_url) {
-            Ok(url) => url,
-            Err(_) => {
-                return error_response(
-                    StatusCode::BAD_REQUEST,
-                    format!("invalid provider URL: {}", provider.base_url),
-                )
+    // Validate + normalize the provider list when one was sent.
+    let providers: Option<Vec<MayaProvider>> = match &req.maya_providers {
+        None => None,
+        Some(list) => {
+            let mut normalized: Vec<MayaProvider> = Vec::with_capacity(list.len());
+            for provider in list {
+                let name = provider.name.trim();
+                let base_url = provider.base_url.trim().trim_end_matches('/');
+                if name.is_empty() {
+                    return error_response(
+                        StatusCode::BAD_REQUEST,
+                        "provider names must not be empty",
+                    );
+                }
+                let parsed = match reqwest::Url::parse(base_url) {
+                    Ok(url) => url,
+                    Err(_) => {
+                        return error_response(
+                            StatusCode::BAD_REQUEST,
+                            format!("invalid provider URL: {}", provider.base_url),
+                        )
+                    }
+                };
+                if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+                    return error_response(
+                        StatusCode::BAD_REQUEST,
+                        format!(
+                            "provider URL must be http(s) with a host: {}",
+                            provider.base_url
+                        ),
+                    );
+                }
+                normalized.push(MayaProvider {
+                    name: name.to_string(),
+                    base_url: base_url.to_string(),
+                });
             }
-        };
-        if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                format!(
-                    "provider URL must be http(s) with a host: {}",
-                    provider.base_url
-                ),
-            );
+            Some(normalized)
         }
-        providers.push(MayaProvider {
-            name: name.to_string(),
-            base_url: base_url.to_string(),
-        });
-    }
+    };
 
+    // Merge onto the current state: sections not sent keep their
+    // live values, and the file keeps the provider list it had
+    // when only other sections were posted.
+    let persisted = state.persisted.read().await.clone();
+    let current_providers = state.maya_providers.read().await.clone();
     let file = SettingsFile {
-        maya_providers: providers.clone(),
+        maya_providers: providers.clone().unwrap_or(current_providers),
+        server: req.server.clone().unwrap_or(persisted.server),
+        general: req.general.clone().unwrap_or(persisted.general),
+        defaults: req.defaults.clone().unwrap_or(persisted.defaults),
     };
     if let Err(e) = tokio::fs::create_dir_all(&state.settings_dir).await {
         return error_response(
@@ -1238,10 +1641,18 @@ async fn update_settings(
         );
     }
 
-    *state.maya_providers.write().await = providers;
-    *state.maya_source.write().await = "settings";
-    // The new list invalidates every cached provider result.
-    *state.maya_cache.write().await = MayaCache::default();
+    *state.persisted.write().await = PersistedSettings {
+        server: file.server.clone(),
+        general: file.general.clone(),
+        defaults: file.defaults.clone(),
+    };
+    if let Some(providers) = providers {
+        *state.maya_providers.write().await = providers;
+        *state.maya_source.write().await = "settings";
+        // The new list invalidates every cached provider result.
+        *state.maya_cache.write().await = MayaCache::default();
+    }
+    log_line(&state, "settings updated".to_string()).await;
 
     let mut view = settings_view(&state).await;
     if std::env::var("QUACK_MAYA_PROVIDERS").is_ok() {
@@ -1349,11 +1760,20 @@ async fn chat_completions(State(state): State<Arc<AppState>>, body: axum::body::
     //    loads on demand through the same format dispatch as
     //    POST /api/v1/models/load (a Splash model surfaces the
     //    dispatch's 501 here). Maya models never JIT — they are
-    //    already serving, and step 2 handled them.
+    //    already serving, and step 2 handled them. The Server
+    //    Settings JIT toggle gates this step.
     if target.is_none() {
         if let Some(model) = &requested {
+            if !state.persisted.read().await.server.jit {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "model {model} is not loaded and just-in-time loading is off (Server Settings)"
+                    ),
+                );
+            }
             if let Some(entry) = resolve_model(&state, model) {
-                match spawn_instance(&state, &entry, None, None).await {
+                match spawn_instance(&state, &entry, None, None, LoadKnobs::default()).await {
                     Ok(instance) => {
                         target = Some((format!("http://127.0.0.1:{}", instance.port), None))
                     }
@@ -1369,6 +1789,15 @@ async fn chat_completions(State(state): State<Arc<AppState>>, body: axum::body::
             "no loaded instance matches the requested model; load a model first",
         );
     };
+    log_line(
+        &state,
+        format!(
+            "chat → {} (model {})",
+            base_url,
+            requested.as_deref().unwrap_or("?")
+        ),
+    )
+    .await;
 
     let out_body: Vec<u8> = match &rewrite {
         Some(model_id) => {
@@ -1473,6 +1902,7 @@ async fn main() {
         .unwrap_or_else(|_| default_backends_dir());
     let settings_dir = settings_dir();
     let (maya_providers, maya_source) = resolve_maya_providers(&settings_dir);
+    let persisted = resolve_persisted(&settings_dir);
 
     let state = Arc::new(AppState {
         port,
@@ -1487,10 +1917,13 @@ async fn main() {
         maya_source: RwLock::new(maya_source),
         maya_cache: RwLock::new(MayaCache::default()),
         downloads: RwLock::new(HashMap::new()),
+        logs: RwLock::new(VecDeque::new()),
+        persisted: RwLock::new(persisted),
     });
     let app = Router::new()
         .route("/api/v1/models", get(list_models))
         .route("/api/v1/status", get(status))
+        .route("/api/v1/logs", get(get_logs))
         .route("/api/v1/models/load", post(load_model))
         .route("/api/v1/models/unload", post(unload_model))
         .route("/api/v1/discover/search", get(discover_search))
@@ -1508,12 +1941,16 @@ async fn main() {
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .expect("quackd: failed to bind listen address");
-    println!(
-        "quackd {} listening on http://{addr} (models dir: {}, backends dir: {})",
-        env!("CARGO_PKG_VERSION"),
-        state.models_dir.display(),
-        state.backends_dir.display()
-    );
+    log_line(
+        &state,
+        format!(
+            "quackd {} listening on http://{addr} (models dir: {}, backends dir: {})",
+            env!("CARGO_PKG_VERSION"),
+            state.models_dir.display(),
+            state.backends_dir.display()
+        ),
+    )
+    .await;
 
     // On Ctrl-C, stop every engine child before exiting so no
     // llama-server is ever orphaned holding GPU memory.

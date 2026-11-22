@@ -1,5 +1,6 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import Toggle from "../components/Toggle";
+import { apiBase } from "../api";
 
 const ENDPOINTS = [
   "POST /v1/chat/completions",
@@ -14,6 +15,19 @@ const ENDPOINTS = [
  *  P0; real start/stop wires to quackd in P2. */
 export default function Developer() {
   const [running, setRunning] = useState(true);
+  const [reachable, setReachable] = useState("http://127.0.0.1:1234");
+
+  // The daemon's real base (the Tauri shell may have put it on
+  // 1235 when LM Studio owns 1234).
+  useEffect(() => {
+    let cancelled = false;
+    void apiBase().then((base) => {
+      if (!cancelled) setReachable(base);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   return (
     <div className="h-full overflow-auto">
@@ -40,7 +54,7 @@ export default function Developer() {
           <div className="mt-4 flex items-center gap-2 border-t border-edge pt-4 text-muted">
             <span>Reachable at:</span>
             <code className="rounded bg-app-bg px-2 py-0.5 font-mono text-[12px] text-ink">
-              http://127.0.0.1:1234
+              {reachable}
             </code>
           </div>
         </section>

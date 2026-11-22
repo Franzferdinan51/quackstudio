@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import { ArrowUp, ChevronDown, Loader2, Paperclip } from "lucide-react";
 import type { ModelEntry } from "../types";
-import { DAEMON_URL, formatGB } from "../types";
+import { formatGB } from "../types";
+import { apiBase } from "../api";
 
 interface ChatMessage {
   role: "user" | "assistant";
@@ -29,36 +30,39 @@ export default function Chat() {
   // (e.g. loaded from the CLI), adopt it so the chat just works.
   useEffect(() => {
     let cancelled = false;
-    fetch(`${DAEMON_URL}/api/v1/models`)
-      .then((res) => {
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        return res.json() as Promise<ModelEntry[]>;
-      })
-      .then((data) => {
-        if (cancelled) return;
-        setModels(data);
-        // Library's "Use in New Chat" leaves the model key in
-        // sessionStorage; adopt (and load) it on arrival.
-        const pending = sessionStorage.getItem("quack.useInChat");
-        if (pending) {
-          sessionStorage.removeItem("quack.useInChat");
-          const wanted = data.find((m) => m.key === pending);
-          if (wanted) {
-            void selectModel(wanted);
-            return;
+    void (async () => {
+      const base = await apiBase();
+      fetch(`${base}/api/v1/models`)
+        .then((res) => {
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          return res.json() as Promise<ModelEntry[]>;
+        })
+        .then((data) => {
+          if (cancelled) return;
+          setModels(data);
+          // Library's "Use in New Chat" leaves the model key in
+          // sessionStorage; adopt (and load) it on arrival.
+          const pending = sessionStorage.getItem("quack.useInChat");
+          if (pending) {
+            sessionStorage.removeItem("quack.useInChat");
+            const wanted = data.find((m) => m.key === pending);
+            if (wanted) {
+              void selectModel(wanted);
+              return;
+            }
           }
-        }
-        const already = data.find((m) => m.loaded_instances.length > 0);
-        if (already) {
-          setSelected(already);
-          setPhase("ready");
-        }
-      })
-      .catch(() => {
-        if (!cancelled) {
-          setError("cannot reach quackd — is the daemon running?");
-        }
-      });
+          const already = data.find((m) => m.loaded_instances.length > 0);
+          if (already) {
+            setSelected(already);
+            setPhase("ready");
+          }
+        })
+        .catch(() => {
+          if (!cancelled) {
+            setError("cannot reach quackd — is the daemon running?");
+          }
+        });
+    })();
     return () => {
       cancelled = true;
     };
@@ -80,7 +84,8 @@ export default function Chat() {
     }
     setPhase("loading");
     try {
-      const res = await fetch(`${DAEMON_URL}/api/v1/models/load`, {
+      const base = await apiBase();
+      const res = await fetch(`${base}/api/v1/models/load`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ model: model.key }),
@@ -112,7 +117,8 @@ export default function Chat() {
     setSending(true);
     setError(null);
     try {
-      const res = await fetch(`${DAEMON_URL}/v1/chat/completions`, {
+      const base = await apiBase();
+      const res = await fetch(`${base}/v1/chat/completions`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({

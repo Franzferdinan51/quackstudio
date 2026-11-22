@@ -22,7 +22,48 @@ export interface ModelEntry {
   loaded_instances: LoadedInstance[];
 }
 
-export const DAEMON_URL = "http://127.0.0.1:1234";
+/** A Maya provider entry (quack-core's MayaProvider). */
+export interface MayaProvider {
+  name: string;
+  base_url: string;
+}
+
+/** GET /api/v1/settings. POST returns the same shape, plus an
+ *  optional `note` (e.g. when the env var overrides the file). */
+export interface SettingsView {
+  version: string;
+  port: number;
+  models_dir: string;
+  backends_dir: string;
+  maya_providers: MayaProvider[];
+  maya_providers_source: "env" | "settings" | "default";
+  note?: string;
+}
+
+/** One Hugging Face search result (GET /api/v1/discover/search). */
+export interface DiscoverModel {
+  id: string;
+  downloads: number | null;
+  likes: number | null;
+  pipeline_tag: string | null;
+}
+
+/** One downloadable .gguf file in a repo (GET /api/v1/discover/files). */
+export interface DiscoverFile {
+  filename: string;
+  size: number | null;
+}
+
+/** A download job (GET /api/v1/downloads, POST /api/v1/models/download). */
+export interface DownloadJob {
+  id: string;
+  repo: string;
+  filename: string;
+  bytes_done: number;
+  bytes_total: number | null;
+  status: "downloading" | "done" | "error";
+  error?: string;
+}
 
 export function formatGB(bytes: number): string {
   return `${(bytes / 1_000_000_000).toFixed(2)} GB`;

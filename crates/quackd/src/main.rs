@@ -1,11 +1,17 @@
 //! quackd — the QuackStudio daemon.
 //!
-//! P3 surface (see ../DESIGN.md):
+//! P4 surface (see ../DESIGN.md):
 //!   GET  /api/v1/models          library index + loaded instances,
 //!                                with Maya remote models merged in
 //!   GET  /api/v1/status          daemon status
 //!   POST /api/v1/models/load     spawn a backend engine for a model
 //!   POST /api/v1/models/unload   stop an instance by id
+//!   GET  /api/v1/discover/search Hugging Face model search (proxy)
+//!   GET  /api/v1/discover/files  a repo's downloadable .gguf files
+//!   POST /api/v1/models/download start a background download job
+//!   GET  /api/v1/downloads       download jobs with progress
+//!   GET  /api/v1/settings        effective settings
+//!   POST /api/v1/settings        persist + apply settings
 //!   GET  /v1/models              OpenAI-compat list (loaded only,
 //!                                plus Maya remote models)
 //!   POST /v1/chat/completions    proxy to the instance's engine (SSE passthrough)
@@ -36,12 +42,15 @@
 //!   QUACK_MLX_PYTHON    MLX python           (overrides oMLX discovery;
 //!                        fallback ~/mlx-venv/bin/python)
 //!   QUACK_MAYA_PROVIDERS  Maya providers as comma-separated
-//!                        `name=url` pairs (default: Duckets' six
-//!                        per-provider endpoints on the Mac)
+//!                        `name=url` pairs. Beats the settings file,
+//!                        which beats the defaults (Duckets' six
+//!                        per-provider endpoints on the Mac).
+//!   QUACK_SETTINGS_DIR  settings directory (default
+//!                        ~/.quackstudio; holds settings.json)
 
 use axum::{
     body::Body,
-    extract::State,
+    extract::{Query, State},
     http::{header, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -55,11 +64,12 @@ use quack_core::{
 use serde::Serialize;
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::io::AsyncWriteExt;
 use tokio::process::{Child, Command};
 use tokio::sync::RwLock;
 use tower_http::cors::CorsLayer;
@@ -89,12 +99,21 @@ struct AppState {
     port: u16,
     models_dir: PathBuf,
     backends_dir: PathBuf,
+    settings_dir: PathBuf,
     instances: RwLock<HashMap<String, LoadedInstance>>,
     next_port: AtomicU16,
     next_instance: AtomicU64,
     http: reqwest::Client,
-    maya_providers: Vec<MayaProvider>,
+    /// Effective Maya provider list; POST /api/v1/settings swaps
+    /// it live, so it sits behind a lock unlike the static config.
+    maya_providers: RwLock<Vec<MayaProvider>>,
+    /// Where the effective list came from:
+    /// "env" | "settings" | "default".
+    maya_source: RwLock<&'static str>,
     maya_cache: RwLock<MayaCache>,
+    /// In-flight and finished download jobs, by job id
+    /// (`<repo>/<filename>`).
+    downloads: RwLock<HashMap<String, Arc<RwLock<DownloadJob>>>>,
 }
 
 /// A library entry as served by `/api/v1/models`: the entry itself
@@ -208,8 +227,8 @@ async fn maya_snapshot(state: &Arc<AppState>) -> Vec<MayaProviderStatus> {
             }
         }
     }
-    let fetches = state
-        .maya_providers
+    let providers = state.maya_providers.read().await.clone();
+    let fetches = providers
         .iter()
         .map(|provider| fetch_provider_models(&state.http, provider));
     let providers: Vec<MayaProviderStatus> = futures_util::future::join_all(fetches).await;
@@ -288,7 +307,7 @@ async fn status(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
         "backends_dir": state.backends_dir.to_string_lossy(),
         "model_count": model_count,
         "loaded_instances": loaded_count,
-        "maya_providers": state.maya_providers.len(),
+        "maya_providers": state.maya_providers.read().await.len(),
         "maya_providers_online": maya_online,
     }))
 }
@@ -765,6 +784,476 @@ async fn unload_model(
 }
 
 // ---------------------------------------------------------------------------
+// Discover (Hugging Face catalog proxy)
+// ---------------------------------------------------------------------------
+
+/// Budget for Hugging Face catalog calls.
+const HF_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[derive(serde::Deserialize)]
+struct SearchParams {
+    q: Option<String>,
+}
+
+/// GET /api/v1/discover/search?q=… — Hugging Face model search,
+/// trimmed to the fields the Discover page renders
+/// (`id`, `downloads`, `likes`, `pipeline_tag`).
+async fn discover_search(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<SearchParams>,
+) -> Response {
+    let query = params.q.unwrap_or_default();
+    let resp = match state
+        .http
+        .get("https://huggingface.co/api/models")
+        .query(&[
+            ("search", query.as_str()),
+            ("limit", "30"),
+            ("sort", "downloads"),
+            ("direction", "-1"),
+        ])
+        .timeout(HF_TIMEOUT)
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => resp,
+        Ok(resp) => {
+            return error_response(
+                StatusCode::BAD_GATEWAY,
+                format!("Hugging Face search failed: HTTP {}", resp.status()),
+            )
+        }
+        Err(e) => {
+            return error_response(
+                StatusCode::BAD_GATEWAY,
+                format!("Hugging Face search failed: {e}"),
+            )
+        }
+    };
+    let value: serde_json::Value = match resp.json().await {
+        Ok(value) => value,
+        Err(e) => {
+            return error_response(
+                StatusCode::BAD_GATEWAY,
+                format!("Hugging Face search returned an unreadable body: {e}"),
+            )
+        }
+    };
+    let results: Vec<serde_json::Value> = value
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .map(|item| {
+                    serde_json::json!({
+                        "id": item.get("id").cloned().unwrap_or(serde_json::Value::Null),
+                        "downloads": item.get("downloads").cloned().unwrap_or(serde_json::Value::Null),
+                        "likes": item.get("likes").cloned().unwrap_or(serde_json::Value::Null),
+                        "pipeline_tag": item.get("pipeline_tag").cloned().unwrap_or(serde_json::Value::Null),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Json(results).into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct FilesParams {
+    repo: Option<String>,
+}
+
+/// GET /api/v1/discover/files?repo=owner/name — the repo's `.gguf`
+/// files, with sizes when Hugging Face reports them (`blobs=true`
+/// asks for blob metadata; a missing size stays `null`).
+async fn discover_files(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<FilesParams>,
+) -> Response {
+    let Some(repo) = params.repo.filter(|r| !r.trim().is_empty()) else {
+        return error_response(StatusCode::BAD_REQUEST, "missing repo parameter");
+    };
+    let url = format!("https://huggingface.co/api/models/{repo}");
+    let resp = match state
+        .http
+        .get(&url)
+        .query(&[("blobs", "true")])
+        .timeout(HF_TIMEOUT)
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => resp,
+        Ok(resp) => {
+            return error_response(
+                StatusCode::BAD_GATEWAY,
+                format!("Hugging Face repo lookup failed: HTTP {}", resp.status()),
+            )
+        }
+        Err(e) => {
+            return error_response(
+                StatusCode::BAD_GATEWAY,
+                format!("Hugging Face repo lookup failed: {e}"),
+            )
+        }
+    };
+    let value: serde_json::Value = match resp.json().await {
+        Ok(value) => value,
+        Err(e) => {
+            return error_response(
+                StatusCode::BAD_GATEWAY,
+                format!("Hugging Face repo lookup returned an unreadable body: {e}"),
+            )
+        }
+    };
+    let files: Vec<serde_json::Value> = value
+        .get("siblings")
+        .and_then(|siblings| siblings.as_array())
+        .map(|siblings| {
+            siblings
+                .iter()
+                .filter_map(|sibling| {
+                    let filename = sibling.get("rfilename")?.as_str()?;
+                    if !filename.to_lowercase().ends_with(".gguf") {
+                        return None;
+                    }
+                    Some(serde_json::json!({
+                        "filename": filename,
+                        "size": sibling.get("size").cloned().unwrap_or(serde_json::Value::Null),
+                    }))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Json(files).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Downloads
+// ---------------------------------------------------------------------------
+
+/// One model-file download job. Jobs live in memory only; a
+/// finished file lands in the models directory and the library
+/// scanner picks it up from there.
+#[derive(Clone, Serialize)]
+struct DownloadJob {
+    /// `<repo>/<filename>`.
+    id: String,
+    repo: String,
+    filename: String,
+    bytes_done: u64,
+    /// From the response's content-length, when the server sends
+    /// one (Hugging Face's resolve endpoint does).
+    bytes_total: Option<u64>,
+    /// "downloading" | "done" | "error"
+    status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct DownloadRequest {
+    repo: String,
+    filename: String,
+}
+
+/// A repo id is exactly `owner/name`, both parts plain names —
+/// anything else (extra slashes, `..`) is rejected so a download
+/// can never write outside the models directory.
+fn valid_repo(repo: &str) -> bool {
+    let mut parts = repo.split('/');
+    let owner = parts.next().unwrap_or("");
+    let name = parts.next().unwrap_or("");
+    parts.next().is_none()
+        && !owner.is_empty()
+        && !name.is_empty()
+        && !owner.contains("..")
+        && !name.contains("..")
+}
+
+/// A bare file name: no separators, no traversal.
+fn valid_filename(filename: &str) -> bool {
+    !filename.is_empty()
+        && !filename.contains('/')
+        && !filename.contains('\\')
+        && !filename.contains("..")
+}
+
+/// POST /api/v1/models/download — start (or re-report) a
+/// background download of one repo file into
+/// `<models_dir>/<repo>/<filename>`.
+async fn start_download(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<DownloadRequest>,
+) -> Response {
+    let repo = req.repo.trim().to_string();
+    let filename = req.filename.trim().to_string();
+    if !valid_repo(&repo) {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            format!("invalid repo (want owner/name): {repo}"),
+        );
+    }
+    if !valid_filename(&filename) {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            format!("invalid filename: {filename}"),
+        );
+    }
+    let id = format!("{repo}/{filename}");
+    // A job already downloading this file is returned as-is —
+    // never two writers on one destination.
+    {
+        let jobs = state.downloads.read().await;
+        if let Some(existing) = jobs.get(&id) {
+            let job = existing.read().await;
+            if job.status == "downloading" {
+                return Json(job.clone()).into_response();
+            }
+        }
+    }
+    let job = Arc::new(RwLock::new(DownloadJob {
+        id: id.clone(),
+        repo,
+        filename,
+        bytes_done: 0,
+        bytes_total: None,
+        status: "downloading".to_string(),
+        error: None,
+    }));
+    state.downloads.write().await.insert(id, job.clone());
+    tokio::spawn(run_download(state.clone(), job.clone()));
+    let snapshot = job.read().await.clone();
+    Json(snapshot).into_response()
+}
+
+/// The download worker: stream the file to `<filename>.part`,
+/// rename into place on success, and keep the job's counters
+/// current as chunks land.
+async fn run_download(state: Arc<AppState>, job: Arc<RwLock<DownloadJob>>) {
+    let (repo, filename) = {
+        let job = job.read().await;
+        (job.repo.clone(), job.filename.clone())
+    };
+    match download_file(&state, &job, &repo, &filename).await {
+        Ok(()) => {
+            let mut job = job.write().await;
+            job.status = "done".to_string();
+            if job.bytes_total.is_none() {
+                job.bytes_total = Some(job.bytes_done);
+            }
+        }
+        Err(message) => {
+            let mut job = job.write().await;
+            job.status = "error".to_string();
+            job.error = Some(message);
+        }
+    }
+}
+
+async fn download_file(
+    state: &Arc<AppState>,
+    job: &Arc<RwLock<DownloadJob>>,
+    repo: &str,
+    filename: &str,
+) -> Result<(), String> {
+    let dest_dir = state.models_dir.join(repo);
+    tokio::fs::create_dir_all(&dest_dir)
+        .await
+        .map_err(|e| format!("cannot create {}: {e}", dest_dir.display()))?;
+    let part_path = dest_dir.join(format!("{filename}.part"));
+    let final_path = dest_dir.join(filename);
+    let url = format!("https://huggingface.co/{repo}/resolve/main/{filename}");
+    let resp = state
+        .http
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("download request failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("download failed: HTTP {}", resp.status()));
+    }
+    job.write().await.bytes_total = resp.content_length();
+    let mut file = tokio::fs::File::create(&part_path)
+        .await
+        .map_err(|e| format!("cannot create {}: {e}", part_path.display()))?;
+    let mut stream = resp.bytes_stream();
+    let mut written: u64 = 0;
+    while let Some(chunk) = stream.next().await {
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(e) => {
+                let _ = tokio::fs::remove_file(&part_path).await;
+                return Err(format!("download interrupted: {e}"));
+            }
+        };
+        if let Err(e) = file.write_all(&chunk).await {
+            let _ = tokio::fs::remove_file(&part_path).await;
+            return Err(format!("cannot write {}: {e}", part_path.display()));
+        }
+        written += chunk.len() as u64;
+        job.write().await.bytes_done = written;
+    }
+    // Close before the rename so no buffered handle straddles it.
+    drop(file);
+    tokio::fs::rename(&part_path, &final_path)
+        .await
+        .map_err(|e| format!("cannot move the finished download into place: {e}"))?;
+    Ok(())
+}
+
+/// GET /api/v1/downloads — every known job, sorted by id.
+async fn list_downloads(State(state): State<Arc<AppState>>) -> Json<Vec<DownloadJob>> {
+    let jobs = state.downloads.read().await;
+    let mut list: Vec<DownloadJob> = Vec::with_capacity(jobs.len());
+    for job in jobs.values() {
+        list.push(job.read().await.clone());
+    }
+    list.sort_by(|a, b| a.id.cmp(&b.id));
+    Json(list)
+}
+
+// ---------------------------------------------------------------------------
+// Settings
+// ---------------------------------------------------------------------------
+
+/// On-disk settings (`<settings_dir>/settings.json`). Only the
+/// Maya provider list is persisted today — it is the settings
+/// surface the Settings page can edit.
+#[derive(Serialize, serde::Deserialize)]
+struct SettingsFile {
+    maya_providers: Vec<MayaProvider>,
+}
+
+/// The settings directory: `QUACK_SETTINGS_DIR`, else
+/// `~/.quackstudio`.
+fn settings_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("QUACK_SETTINGS_DIR") {
+        if !dir.is_empty() {
+            return PathBuf::from(dir);
+        }
+    }
+    home_dir().join(".quackstudio")
+}
+
+/// Providers persisted in the settings file, when it exists and
+/// parses. Entries were validated on save; a hand-corrupted file
+/// simply falls back to the defaults.
+fn read_settings_providers(dir: &Path) -> Option<Vec<MayaProvider>> {
+    let text = std::fs::read_to_string(dir.join("settings.json")).ok()?;
+    let file: SettingsFile = serde_json::from_str(&text).ok()?;
+    Some(file.maya_providers)
+}
+
+/// Provider resolution at startup: `QUACK_MAYA_PROVIDERS` env
+/// beats the settings file, which beats the built-in defaults.
+fn resolve_maya_providers(dir: &Path) -> (Vec<MayaProvider>, &'static str) {
+    if std::env::var("QUACK_MAYA_PROVIDERS").is_ok() {
+        return (maya_providers_from_env(), "env");
+    }
+    if let Some(providers) = read_settings_providers(dir) {
+        return (providers, "settings");
+    }
+    (default_maya_providers(), "default")
+}
+
+/// The settings view both settings endpoints answer with.
+async fn settings_view(state: &Arc<AppState>) -> serde_json::Value {
+    let providers = state.maya_providers.read().await.clone();
+    let source = *state.maya_source.read().await;
+    serde_json::json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "port": state.port,
+        "models_dir": state.models_dir.to_string_lossy(),
+        "backends_dir": state.backends_dir.to_string_lossy(),
+        "maya_providers": providers,
+        "maya_providers_source": source,
+    })
+}
+
+/// GET /api/v1/settings — the effective settings.
+async fn get_settings(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    Json(settings_view(&state).await)
+}
+
+#[derive(serde::Deserialize)]
+struct SettingsRequest {
+    maya_providers: Vec<MayaProvider>,
+}
+
+/// POST /api/v1/settings — validate, persist, and apply a new
+/// Maya provider list. The file is written before the live list
+/// swaps, so a failed write can never desync memory from storage.
+async fn update_settings(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<SettingsRequest>,
+) -> Response {
+    let mut providers: Vec<MayaProvider> = Vec::with_capacity(req.maya_providers.len());
+    for provider in &req.maya_providers {
+        let name = provider.name.trim();
+        let base_url = provider.base_url.trim().trim_end_matches('/');
+        if name.is_empty() {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "provider names must not be empty",
+            );
+        }
+        let parsed = match reqwest::Url::parse(base_url) {
+            Ok(url) => url,
+            Err(_) => {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    format!("invalid provider URL: {}", provider.base_url),
+                )
+            }
+        };
+        if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "provider URL must be http(s) with a host: {}",
+                    provider.base_url
+                ),
+            );
+        }
+        providers.push(MayaProvider {
+            name: name.to_string(),
+            base_url: base_url.to_string(),
+        });
+    }
+
+    let file = SettingsFile {
+        maya_providers: providers.clone(),
+    };
+    if let Err(e) = tokio::fs::create_dir_all(&state.settings_dir).await {
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("cannot create the settings directory: {e}"),
+        );
+    }
+    let text = serde_json::to_string_pretty(&file).unwrap_or_default();
+    if let Err(e) = tokio::fs::write(state.settings_dir.join("settings.json"), text).await {
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("cannot write settings: {e}"),
+        );
+    }
+
+    *state.maya_providers.write().await = providers;
+    *state.maya_source.write().await = "settings";
+    // The new list invalidates every cached provider result.
+    *state.maya_cache.write().await = MayaCache::default();
+
+    let mut view = settings_view(&state).await;
+    if std::env::var("QUACK_MAYA_PROVIDERS").is_ok() {
+        view["note"] = serde_json::Value::String(
+            "Saved — but QUACK_MAYA_PROVIDERS is set and wins on the next daemon start until it is unset."
+                .to_string(),
+        );
+    }
+    Json(view).into_response()
+}
+
+// ---------------------------------------------------------------------------
 // Chat proxy
 // ---------------------------------------------------------------------------
 
@@ -945,8 +1434,10 @@ fn default_backends_dir() -> PathBuf {
 }
 
 /// Maya providers from `QUACK_MAYA_PROVIDERS` (comma-separated
-/// `name=url` pairs); unset or unparseable entries fall back to
-/// Duckets' defaults. Malformed pairs are skipped, not fatal.
+/// `name=url` pairs); unparseable entries fall back to Duckets'
+/// defaults. Malformed pairs are skipped, not fatal. Startup
+/// resolution (env > settings file > defaults) lives in
+/// `resolve_maya_providers`.
 fn maya_providers_from_env() -> Vec<MayaProvider> {
     match std::env::var("QUACK_MAYA_PROVIDERS") {
         Ok(spec) => spec
@@ -980,23 +1471,33 @@ async fn main() {
     let backends_dir = std::env::var("QUACK_BACKENDS_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| default_backends_dir());
+    let settings_dir = settings_dir();
+    let (maya_providers, maya_source) = resolve_maya_providers(&settings_dir);
 
     let state = Arc::new(AppState {
         port,
         models_dir,
         backends_dir,
+        settings_dir,
         instances: RwLock::new(HashMap::new()),
         next_port: AtomicU16::new(FIRST_ENGINE_PORT),
         next_instance: AtomicU64::new(0),
         http: reqwest::Client::new(),
-        maya_providers: maya_providers_from_env(),
+        maya_providers: RwLock::new(maya_providers),
+        maya_source: RwLock::new(maya_source),
         maya_cache: RwLock::new(MayaCache::default()),
+        downloads: RwLock::new(HashMap::new()),
     });
     let app = Router::new()
         .route("/api/v1/models", get(list_models))
         .route("/api/v1/status", get(status))
         .route("/api/v1/models/load", post(load_model))
         .route("/api/v1/models/unload", post(unload_model))
+        .route("/api/v1/discover/search", get(discover_search))
+        .route("/api/v1/discover/files", get(discover_files))
+        .route("/api/v1/models/download", post(start_download))
+        .route("/api/v1/downloads", get(list_downloads))
+        .route("/api/v1/settings", get(get_settings).post(update_settings))
         .route("/v1/models", get(openai_models))
         .route("/v1/chat/completions", post(chat_completions))
         // The Tauri dev UI (localhost:5173) talks to us cross-origin.

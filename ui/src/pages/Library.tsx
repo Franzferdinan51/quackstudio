@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useState } from "react";
 import { Check, Loader2, MessageSquare, Search, Upload, X } from "lucide-react";
 import type { ModelEntry } from "../types";
-import { DAEMON_URL, formatGB } from "../types";
+import { formatGB } from "../types";
+import { apiBase } from "../api";
 
 /** Shown (clearly labeled) only when quackd is unreachable. */
 const SAMPLE_ROWS: ModelEntry[] = [
@@ -82,7 +83,8 @@ export default function Library() {
 
   const fetchModels = useCallback(async () => {
     try {
-      const res = await fetch(`${DAEMON_URL}/api/v1/models`);
+      const base = await apiBase();
+      const res = await fetch(`${base}/api/v1/models`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = (await res.json()) as ModelEntry[];
       setModels(data);
@@ -119,7 +121,8 @@ export default function Library() {
     setLoadBusy(true);
     setLoadMsg(null);
     try {
-      const res = await fetch(`${DAEMON_URL}/api/v1/models/load`, {
+      const base = await apiBase();
+      const res = await fetch(`${base}/api/v1/models/load`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -162,7 +165,8 @@ export default function Library() {
     setUnloadingId(instanceId);
     setLoadMsg(null);
     try {
-      const res = await fetch(`${DAEMON_URL}/api/v1/models/unload`, {
+      const base = await apiBase();
+      const res = await fetch(`${base}/api/v1/models/unload`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ instance_id: instanceId }),

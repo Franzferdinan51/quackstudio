@@ -716,10 +716,12 @@ export default function SettingsPage({ status }: { status: StatusView | null }) 
                   />
                   <InfoRow
                     label="Splash"
-                    hint="Served through Maya/Strata today; a native pack is pending."
+                    hint="Native pack — quackd spawns the pack's splash_engine server."
                     value={
                       status
-                        ? `${status.packs.splash} — via Maya/Strata (pending)`
+                        ? status.packs.splash === "not bundled"
+                          ? "not bundled"
+                          : `Splash (Metal) ${status.packs.splash}`
                         : "—"
                     }
                   />

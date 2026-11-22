@@ -469,12 +469,6 @@ export default function Library({ category }: { category: LibraryCategory }) {
           <div className="mt-4 flex gap-2">
             <button
               type="button"
-              disabled={selected.format === "splash"}
-              title={
-                selected.format === "splash"
-                  ? "Splash arrives with the Strata pack (P3)"
-                  : undefined
-              }
               onClick={() => useInNewChat(selected)}
               className="flex flex-1 items-center justify-center gap-1.5 rounded-lg bg-panel-2 px-3 py-2 text-[13px] transition-colors hover:bg-edge disabled:cursor-not-allowed disabled:opacity-40"
             >
@@ -682,10 +676,16 @@ export default function Library({ category }: { category: LibraryCategory }) {
                   onChange={(e) => setCtxLength(Number(e.target.value))}
                   className="mt-2 w-full accent-accent"
                 />
-                {selected.format !== "gguf" && (
+                {selected.format === "mlx" && (
                   <p className="mt-1 text-[11px] text-muted">
                     Context length is passed to llama.cpp only; the MLX
                     server uses its own default.
+                  </p>
+                )}
+                {selected.format === "splash" && (
+                  <p className="mt-1 text-[11px] text-muted">
+                    Not applied for Splash — the Splash engine sizes
+                    context itself (auto, up to 256K).
                   </p>
                 )}
               </div>
@@ -715,6 +715,9 @@ export default function Library({ category }: { category: LibraryCategory }) {
                   <p className="mt-1 text-[11px] text-muted">
                     GPU offload layers apply to GGUF (llama.cpp) models
                     only.
+                    {selected.format === "splash"
+                      ? " The Splash engine manages its own memory (auto)."
+                      : ""}
                   </p>
                 )}
               </div>
@@ -749,20 +752,24 @@ export default function Library({ category }: { category: LibraryCategory }) {
                 <p className="mt-2.5 text-[11px] text-muted">
                   {selected.format === "gguf"
                     ? "Forwarded to llama-server (-t / -b / -ub) when set."
-                    : "MLX: not applied — mlx_vlm.server has no equivalents; values are stored per model."}
+                    : selected.format === "splash"
+                      ? "Splash: not applied — the splash_engine server has no equivalents; values are stored per model."
+                      : "MLX: not applied — mlx_vlm.server has no equivalents; values are stored per model."}
                 </p>
               </div>
 
               {selected.format === "splash" && (
                 <p className="rounded-xl border border-edge bg-panel-2 px-3.5 py-3 text-[12px] text-muted">
-                  Splash arrives with the Strata pack (P3) — this model
-                  can't be loaded yet.
+                  Loads with the native Splash pack — context and
+                  memory are set to auto (the engine sizes itself),
+                  so the sliders above aren't applied. A 27B package
+                  can take a few minutes to become ready.
                 </p>
               )}
 
               <button
                 type="button"
-                disabled={selected.format === "splash" || loadBusy}
+                disabled={loadBusy}
                 onClick={() => void loadSelected()}
                 className="flex items-center justify-center gap-2 rounded-lg bg-primary px-3 py-2 text-[13px] font-medium text-white transition-opacity disabled:cursor-not-allowed disabled:opacity-40"
               >

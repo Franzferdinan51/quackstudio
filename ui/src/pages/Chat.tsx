@@ -495,6 +495,7 @@ export default function Chat({
                     const loadable =
                       m.format === "gguf" ||
                       m.format === "mlx" ||
+                      m.format === "splash" ||
                       m.format === "maya";
                     return (
                       <button

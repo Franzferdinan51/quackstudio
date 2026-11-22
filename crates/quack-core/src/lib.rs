@@ -493,6 +493,124 @@ pub fn find_omlx_python(backends_dir: &Path) -> Option<PathBuf> {
 }
 
 // ---------------------------------------------------------------------------
+// Splash pack discovery
+// ---------------------------------------------------------------------------
+
+/// A resolved Splash backend pack: everything quackd needs to
+/// spawn the pack's OpenAI-compatible server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SplashPack {
+    /// Pack version from `backend-manifest.json` ("1.3.0").
+    pub version: String,
+    /// The amphibian Python that runs the server
+    /// (`<app layer>/bin/python`).
+    pub python: PathBuf,
+    /// The app layer root (holds `bin/`, `engine/` and the
+    /// server's site-packages).
+    pub app_layer: PathBuf,
+    /// The native engine binary (`<app layer>/engine/splash`),
+    /// passed to the server as `--binary`.
+    pub binary: PathBuf,
+}
+
+/// Find the newest Splash backend pack under `backends_dir`.
+/// Pack directories are named like
+/// `splash-mac-arm64-apple-metal-advsimd-1.3.0`; the highest
+/// trailing version wins. The Python interpreter comes from the
+/// pack's `backend-manifest.json`
+/// (`engine_protocol_server.executable_relative_path`, relative
+/// to `backends_dir/vendor`); when the manifest can't be read,
+/// the newest `app-splash-*` layer under `vendor/_amphibian` is
+/// used instead, mirroring [`find_omlx_python`]. `None` when no
+/// usable pack is installed.
+pub fn find_splash_pack(backends_dir: &Path) -> Option<SplashPack> {
+    // 1. Newest pack directory, by trailing version.
+    let mut best_pack: Option<((u64, u64, u64), PathBuf)> = None;
+    for entry in fs::read_dir(backends_dir).ok()?.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.starts_with("splash-") {
+            continue;
+        }
+        let Some(version) = parse_pack_version(&name) else {
+            continue;
+        };
+        if best_pack.as_ref().map_or(true, |(v, _)| version > *v) {
+            best_pack = Some((version, entry.path()));
+        }
+    }
+
+    // 2. The interpreter: the pack manifest names it; fall back
+    //    to the newest splash app layer under vendor/_amphibian.
+    let vendor = backends_dir.join("vendor");
+    let mut python: Option<PathBuf> = None;
+    let mut version: Option<String> = None;
+    if let Some((_, pack_dir)) = &best_pack {
+        if let Ok(text) = fs::read_to_string(pack_dir.join("backend-manifest.json")) {
+            if let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&text) {
+                if let Some(rel) = manifest
+                    .get("engine_protocol_server")
+                    .and_then(|s| s.get("executable_relative_path"))
+                    .and_then(|v| v.as_str())
+                {
+                    let candidate = vendor.join(rel);
+                    if candidate.is_file() {
+                        python = Some(candidate);
+                    }
+                }
+                version = manifest
+                    .get("version")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned);
+            }
+        }
+    }
+    let python = match python {
+        Some(p) => p,
+        None => {
+            let amphibian = vendor.join("_amphibian");
+            let mut best_layer: Option<(u64, PathBuf)> = None;
+            for entry in fs::read_dir(&amphibian).ok()?.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let Some(build) = name
+                    .strip_prefix("app-splash-")
+                    .and_then(|rest| rest.rsplit('@').next())
+                    .and_then(|n| n.parse::<u64>().ok())
+                else {
+                    continue;
+                };
+                let candidate = entry.path().join("bin").join("python");
+                if !candidate.is_file() {
+                    continue;
+                }
+                if best_layer.as_ref().map_or(true, |(b, _)| build > *b) {
+                    best_layer = Some((build, candidate));
+                }
+            }
+            best_layer?.1
+        }
+    };
+
+    // The app layer is the interpreter's grandparent
+    // (<layer>/bin/python); the native binary sits in its
+    // engine/ directory.
+    let app_layer = python.parent()?.parent()?.to_path_buf();
+    let binary = app_layer.join("engine").join("splash");
+    if !binary.is_file() {
+        return None;
+    }
+    let version = version.unwrap_or_else(|| match &best_pack {
+        Some(((a, b, c), _)) => format!("{a}.{b}.{c}"),
+        None => "unknown".to_string(),
+    });
+    Some(SplashPack {
+        version,
+        python,
+        app_layer,
+        binary,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -710,6 +828,55 @@ mod tests {
         assert!(
             found.ends_with("app-omlx-mac26-arm64@18/bin/python"),
             "picked: {found:?}"
+        );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn find_splash_pack_picks_highest_version_and_manifest_python() {
+        let base = std::env::temp_dir().join(format!(
+            "quack-core-splash-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        // Two pack versions side by side; each manifest points
+        // at its own amphibian layer. The newest pack must win.
+        for (ver, build) in [("0.0.5", 2), ("1.3.0", 8)] {
+            let pack = base.join(format!("splash-mac-arm64-apple-metal-advsimd-{ver}"));
+            fs::create_dir_all(&pack).unwrap();
+            let manifest = format!(
+                "{{\"version\":\"{ver}\",\"engine_protocol_server\":{{\"runtime_kind\":\"splash-server\",\"executable_relative_path\":\"_amphibian/app-splash-mac26-arm64@{build}/bin/python\"}}}}"
+            );
+            fs::write(pack.join("backend-manifest.json"), manifest).unwrap();
+            let layer = base
+                .join("vendor")
+                .join("_amphibian")
+                .join(format!("app-splash-mac26-arm64@{build}"));
+            fs::create_dir_all(layer.join("bin")).unwrap();
+            write_bytes(&layer.join("bin").join("python"), 8);
+            fs::create_dir_all(layer.join("engine")).unwrap();
+            write_bytes(&layer.join("engine").join("splash"), 8);
+        }
+
+        let found = find_splash_pack(&base).expect("a splash pack");
+        assert_eq!(found.version, "1.3.0");
+        assert!(
+            found
+                .python
+                .ends_with("app-splash-mac26-arm64@8/bin/python"),
+            "picked: {:?}",
+            found.python
+        );
+        assert!(
+            found
+                .binary
+                .ends_with("app-splash-mac26-arm64@8/engine/splash"),
+            "picked: {:?}",
+            found.binary
         );
 
         let _ = fs::remove_dir_all(&base);

@@ -41,15 +41,55 @@ pub struct ModelEntry {
     pub size_bytes: u64,
     /// Path of the model directory on disk.
     pub path: PathBuf,
-    /// Architecture string when known (MLX `config.json` today; GGUF
-    /// header parsing lands later).
+    /// Architecture string when known (MLX `config.json`
+    /// `architectures[0]`; GGUF `general.architecture` metadata).
     pub arch: Option<String>,
     /// True when the model ships a vision projector (GGUF `mmproj`)
     /// or declares a vision tower (MLX `vision_config`).
     pub vision: bool,
+    /// Name of the model's main payload file (the main GGUF, the
+    /// largest safetensors shard, the Splash target payload).
+    /// `None` when no payload file could be identified.
+    #[serde(default)]
+    pub file_name: Option<String>,
+    /// Quantization label when derivable: from the GGUF file name
+    /// (`Q4_K_M`, `Q8_0`, …), the GGUF `general.file_type`
+    /// metadata, or an MLX directory name (`4-bit`, `8-bit`).
+    #[serde(default)]
+    pub quantization: Option<String>,
+    /// Context-length ceiling from the model's own metadata
+    /// (GGUF `<arch>.context_length`, MLX `max_position_embeddings`).
+    /// `None` when the metadata does not declare one.
+    #[serde(default)]
+    pub max_context: Option<u32>,
+    /// Serving domain: `"llm"`, or `"embedding"` for models whose
+    /// name marks them as embedding models.
+    #[serde(default = "default_domain")]
+    pub domain: String,
+    /// Scanner flags for this entry (incomplete downloads, missing
+    /// payload files, …). Empty for a healthy model. The Library's
+    /// "Show warnings" filter lists exactly the entries with a
+    /// non-empty list.
+    #[serde(default)]
+    pub warnings: Vec<String>,
     /// Base URL of the remote server when the model is served
     /// remotely (Maya pack entries); `None` for local models.
     pub remote_url: Option<String>,
+}
+
+fn default_domain() -> String {
+    "llm".to_string()
+}
+
+/// The serving domain a directory name implies: embedding models
+/// are the one family the scanner can tell apart by name alone.
+fn domain_for_name(name: &str) -> String {
+    let lower = name.to_lowercase();
+    if lower.contains("embed") || lower.contains("nomic") {
+        "embedding".to_string()
+    } else {
+        "llm".to_string()
+    }
 }
 
 /// Scan a two-level `publisher/model` models directory.
@@ -116,22 +156,43 @@ fn scan_model_dir(publisher: &str, name: &str, dir: &Path) -> Option<ModelEntry>
             .map(|n| n.to_string_lossy().to_lowercase())
             .unwrap_or_default()
     };
+    let base = |format: ModelFormat| ModelEntry {
+        key: format!("{publisher}/{name}"),
+        publisher: publisher.to_string(),
+        display_name: name.to_string(),
+        format,
+        size_bytes,
+        path: dir.to_path_buf(),
+        arch: None,
+        vision: false,
+        file_name: None,
+        quantization: None,
+        max_context: None,
+        domain: domain_for_name(name),
+        warnings: Vec::new(),
+        remote_url: None,
+    };
+    // A leftover `.part` file means a download never finished —
+    // the one warning every format shares.
+    let mut shared_warnings: Vec<String> = Vec::new();
+    if files.iter().any(|(p, _)| file_name(p).ends_with(".part")) {
+        shared_warnings.push("Incomplete download: a .part file is present".to_string());
+    }
 
     // Splash: manifest.json + target/ payload directory. Checked
     // first: a Splash package's payload may itself contain weight
     // files that would otherwise trip the GGUF/MLX rules.
     if dir.join("manifest.json").is_file() && dir.join("target").is_dir() {
-        return Some(ModelEntry {
-            key: format!("{publisher}/{name}"),
-            publisher: publisher.to_string(),
-            display_name: name.to_string(),
-            format: ModelFormat::Splash,
-            size_bytes,
-            path: dir.to_path_buf(),
-            arch: None,
-            vision: dir.join("vision").is_dir(),
-            remote_url: None,
-        });
+        let mut entry = base(ModelFormat::Splash);
+        entry.vision = dir.join("vision").is_dir();
+        entry.warnings = shared_warnings;
+        // The main payload file: the largest file under target/.
+        entry.file_name = files
+            .iter()
+            .filter(|(p, _)| p.starts_with(dir.join("target")))
+            .max_by_key(|(_, size)| *size)
+            .and_then(|(p, _)| p.file_name().map(|n| n.to_string_lossy().into_owned()));
+        return Some(entry);
     }
 
     // GGUF: needs a main file (largest .gguf that is not an mmproj).
@@ -144,18 +205,45 @@ fn scan_model_dir(publisher: &str, name: &str, dir: &Path) -> Option<ModelEntry>
         .iter()
         .filter(|(p, _)| !file_name(p).contains("mmproj"))
         .max_by_key(|(_, size)| *size);
-    if main_gguf.is_some() {
-        return Some(ModelEntry {
-            key: format!("{publisher}/{name}"),
-            publisher: publisher.to_string(),
-            display_name: name.to_string(),
-            format: ModelFormat::Gguf,
-            size_bytes,
-            path: dir.to_path_buf(),
-            arch: None,
-            vision: has_mmproj,
-            remote_url: None,
-        });
+    if let Some((main_path, main_size)) = main_gguf {
+        let mut entry = base(ModelFormat::Gguf);
+        entry.vision = has_mmproj;
+        entry.warnings = shared_warnings;
+        if *main_size == 0 {
+            entry
+                .warnings
+                .push("Main model file is empty (0 bytes)".to_string());
+        }
+        entry.file_name = main_path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned());
+        // Header metadata: architecture, context ceiling, and the
+        // file-type quantization fallback.
+        let metadata = read_gguf_metadata(main_path);
+        entry.arch = metadata.architecture;
+        entry.max_context = metadata.context_length;
+        entry.quantization = entry
+            .file_name
+            .as_deref()
+            .and_then(quantization_from_file_name)
+            .or(metadata.file_type_label);
+        return Some(entry);
+    }
+    // GGUF fragments with no main file (only a vision projector):
+    // still list the entry — flagged — instead of hiding it.
+    if has_mmproj {
+        let mut entry = base(ModelFormat::Gguf);
+        entry.vision = true;
+        entry.warnings = shared_warnings;
+        entry.warnings.push(
+            "No main model file found — only a vision projector (mmproj) is present"
+                .to_string(),
+        );
+        entry.file_name = ggufs
+            .iter()
+            .max_by_key(|(_, size)| *size)
+            .and_then(|(p, _)| p.file_name().map(|n| n.to_string_lossy().into_owned()));
+        return Some(entry);
     }
 
     // MLX: config.json + safetensors weights.
@@ -165,31 +253,234 @@ fn scan_model_dir(publisher: &str, name: &str, dir: &Path) -> Option<ModelEntry>
         .any(|(p, _)| file_name(p).ends_with(".safetensors"));
     if config_path.is_file() && has_safetensors {
         let config_text = fs::read_to_string(&config_path).unwrap_or_default();
-        let arch = serde_json::from_str::<serde_json::Value>(&config_text)
-            .ok()
-            .and_then(|value| {
-                value
-                    .get("architectures")?
-                    .as_array()?
-                    .first()?
-                    .as_str()
-                    .map(str::to_owned)
-            });
-        let vision = config_text.contains("\"vision_config\"");
-        return Some(ModelEntry {
-            key: format!("{publisher}/{name}"),
-            publisher: publisher.to_string(),
-            display_name: name.to_string(),
-            format: ModelFormat::Mlx,
-            size_bytes,
-            path: dir.to_path_buf(),
-            arch,
-            vision,
-            remote_url: None,
+        let config: Option<serde_json::Value> = serde_json::from_str(&config_text).ok();
+        let mut entry = base(ModelFormat::Mlx);
+        entry.vision = config_text.contains("\"vision_config\"");
+        entry.warnings = shared_warnings;
+        entry.arch = config.as_ref().and_then(|value| {
+            value
+                .get("architectures")?
+                .as_array()?
+                .first()?
+                .as_str()
+                .map(str::to_owned)
         });
+        entry.max_context = config.as_ref().and_then(mlx_max_context);
+        entry.quantization = quantization_from_file_name(name);
+        entry.file_name = files
+            .iter()
+            .filter(|(p, _)| file_name(p).ends_with(".safetensors"))
+            .max_by_key(|(_, size)| *size)
+            .and_then(|(p, _)| p.file_name().map(|n| n.to_string_lossy().into_owned()));
+        return Some(entry);
     }
 
     None
+}
+
+/// The context ceiling an MLX `config.json` declares:
+/// `max_position_embeddings` at the top level or inside
+/// `text_config` (vision-language layouts nest it there).
+fn mlx_max_context(config: &serde_json::Value) -> Option<u32> {
+    let dig = |v: &serde_json::Value| -> Option<u32> {
+        v.get("max_position_embeddings")
+            .and_then(|n| n.as_u64())
+            .and_then(|n| u32::try_from(n).ok())
+    };
+    dig(config).or_else(|| config.get("text_config").and_then(dig))
+}
+
+/// Quantization tokens as they appear in GGUF file names and MLX
+/// directory names, longest first so `Q4_K_M` wins over `Q4_0`.
+const QUANT_TOKENS: &[&str] = &[
+    "Q4_K_M", "Q4_K_S", "Q5_K_M", "Q5_K_S", "Q3_K_M", "Q3_K_L", "Q3_K_S", "Q6_K",
+    "Q2_K", "Q8_0", "Q5_0", "Q5_1", "Q4_0", "Q4_1", "IQ4_XS", "IQ4_NL", "IQ3_S",
+    "IQ2_XXS", "IQ2_XS", "IQ2_S", "IQ1_S", "IQ1_M", "BF16", "F16", "F32",
+];
+
+/// The quantization label a file or directory name carries, if
+/// any. GGUF names embed the token (`…-Q4_K_M.gguf`); MLX names
+/// use bit widths (`…-4bit` → `4-bit`).
+fn quantization_from_file_name(name: &str) -> Option<String> {
+    let upper = name.to_uppercase().replace('-', "_");
+    for token in QUANT_TOKENS {
+        if upper.contains(token) {
+            return Some((*token).to_string());
+        }
+    }
+    let lower = name.to_lowercase();
+    for bits in ["4bit", "8bit", "2bit", "3bit", "6bit"] {
+        if lower.contains(bits) {
+            return Some(format!("{}-bit", &bits[..1]));
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
+// GGUF header metadata
+// ---------------------------------------------------------------------------
+
+/// The header facts the library surfaces: `general.architecture`,
+/// `<arch>.context_length`, and `general.file_type` (as a label).
+#[derive(Debug, Default, PartialEq)]
+pub struct GgufMetadata {
+    pub architecture: Option<String>,
+    pub context_length: Option<u32>,
+    pub file_type_label: Option<String>,
+}
+
+/// How much of a GGUF file the metadata reader will scan. The
+/// metadata block sits at the very start of the file, long before
+/// the tensor data; 16 MiB is far beyond any real header.
+const GGUF_METADATA_CAP: usize = 16 * 1024 * 1024;
+
+/// Read a GGUF file's header metadata. Any malformation (bad
+/// magic, truncation, an unknown value type) yields whatever was
+/// gathered before it — the scanner treats metadata as a bonus,
+/// never a gate.
+pub fn read_gguf_metadata(path: &Path) -> GgufMetadata {
+    let Ok(mut file) = fs::File::open(path) else {
+        return GgufMetadata::default();
+    };
+    use std::io::Read;
+    let mut buf = Vec::new();
+    let _ = file
+        .by_ref()
+        .take(GGUF_METADATA_CAP as u64)
+        .read_to_end(&mut buf);
+    parse_gguf_metadata(&buf)
+}
+
+/// A little-endian cursor over the header bytes.
+struct GgufCursor<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> GgufCursor<'a> {
+    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+        let end = self.pos.checked_add(n)?;
+        let slice = self.bytes.get(self.pos..end)?;
+        self.pos = end;
+        Some(slice)
+    }
+    fn u32(&mut self) -> Option<u32> {
+        Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
+    }
+    fn u64(&mut self) -> Option<u64> {
+        Some(u64::from_le_bytes(self.take(8)?.try_into().ok()?))
+    }
+    fn string(&mut self) -> Option<String> {
+        let len = usize::try_from(self.u64()?).ok()?;
+        let raw = self.take(len)?;
+        Some(String::from_utf8_lossy(raw).into_owned())
+    }
+    /// Skip one value of the given GGUF metadata type. `false`
+    /// when the bytes run out or the type is unknown.
+    fn skip_value(&mut self, value_type: u32) -> bool {
+        let size = match value_type {
+            0 | 1 | 7 => 1,  // UINT8, INT8, BOOL
+            2 | 3 => 2,      // UINT16, INT16
+            4 | 5 | 6 => 4,  // UINT32, INT32, FLOAT32
+            10 | 11 | 12 => 8, // UINT64, INT64, FLOAT64
+            8 => return self.string().is_some(), // STRING
+            9 => {
+                // ARRAY: element type + count, then the elements.
+                let Some(elem_type) = self.u32() else {
+                    return false;
+                };
+                let Some(count) = self.u64() else {
+                    return false;
+                };
+                for _ in 0..count {
+                    if !self.skip_value(elem_type) {
+                        return false;
+                    }
+                }
+                return true;
+            }
+            _ => return false,
+        };
+        self.take(size).is_some()
+    }
+}
+
+/// Parse the metadata block out of raw GGUF header bytes.
+fn parse_gguf_metadata(bytes: &[u8]) -> GgufMetadata {
+    let mut out = GgufMetadata::default();
+    let mut cur = GgufCursor { bytes, pos: 0 };
+    if cur.take(4) != Some(b"GGUF".as_slice()) {
+        return out;
+    }
+    let Some(_version) = cur.u32() else { return out };
+    let Some(_tensor_count) = cur.u64() else { return out };
+    let Some(kv_count) = cur.u64() else { return out };
+    let mut file_type: Option<u32> = None;
+    for _ in 0..kv_count {
+        let Some(key) = cur.string() else { return out };
+        let Some(value_type) = cur.u32() else { return out };
+        match (key.as_str(), value_type) {
+            ("general.architecture", 8) => {
+                out.architecture = cur.string();
+            }
+            ("general.file_type", 4) => {
+                file_type = cur.u32();
+            }
+            (_, 8) if key.ends_with(".context_length") => {
+                // Wrong type for a context length; consume it.
+                let _ = cur.string();
+            }
+            _ => {
+                // `<arch>.context_length` is an integer (UINT32 in
+                // practice); capture it, skip everything else.
+                if key.ends_with(".context_length") {
+                    match value_type {
+                        4 => out.context_length = cur.u32(),
+                        10 => {
+                            out.context_length = cur.u64().and_then(|n| u32::try_from(n).ok())
+                        }
+                        _ => {
+                            if !cur.skip_value(value_type) {
+                                return finish_gguf(out, file_type);
+                            }
+                        }
+                    }
+                } else if !cur.skip_value(value_type) {
+                    return finish_gguf(out, file_type);
+                }
+            }
+        }
+    }
+    finish_gguf(out, file_type)
+}
+
+fn finish_gguf(mut out: GgufMetadata, file_type: Option<u32>) -> GgufMetadata {
+    out.file_type_label = file_type.and_then(gguf_file_type_label);
+    out
+}
+
+/// `general.file_type` (llama.cpp `llama_ftype`) → label. Only
+/// the common values are mapped; anything else stays unlabeled.
+fn gguf_file_type_label(file_type: u32) -> Option<String> {
+    let label = match file_type {
+        0 => "F32",
+        1 => "F16",
+        2 => "Q4_0",
+        3 => "Q4_1",
+        6 => "Q5_0",
+        7 => "Q5_1",
+        8 => "Q8_0",
+        10 => "Q2_K",
+        14 => "Q4_K_S",
+        15 => "Q4_K_M",
+        16 => "Q5_K_S",
+        17 => "Q5_K_M",
+        18 => "Q6_K",
+        30 => "BF16",
+        _ => return None,
+    };
+    Some(label.to_string())
 }
 
 /// Recursively collect `(path, size)` for every non-hidden file under
@@ -695,6 +986,13 @@ mod tests {
         assert_eq!(gguf.size_bytes, 110);
         assert!(gguf.vision, "mmproj present means vision");
         assert_eq!(gguf.arch, None);
+        // The fixture GGUF is 100 zero bytes with a real name:
+        // file/quantization/domain come from the name, and a
+        // zero-filled header yields no metadata.
+        assert_eq!(gguf.file_name.as_deref(), Some("test-q4_k_m.gguf"));
+        assert_eq!(gguf.quantization.as_deref(), Some("Q4_K_M"));
+        assert_eq!(gguf.domain, "llm");
+        assert!(gguf.warnings.is_empty(), "warnings: {:?}", gguf.warnings);
 
         let mlx = &entries[2];
         assert_eq!(mlx.key, "mlx-community/Test-MLX");
@@ -724,6 +1022,11 @@ mod tests {
             path: PathBuf::from("/tmp/m"),
             arch: None,
             vision: false,
+            file_name: None,
+            quantization: None,
+            max_context: None,
+            domain: "llm".to_string(),
+            warnings: Vec::new(),
             remote_url: None,
         };
         let cfg = LoadConfig::default_for(&entry);
@@ -895,6 +1198,62 @@ mod tests {
         // The Maya format serializes lowercase, like the others.
         let entry_format = serde_json::to_value(ModelFormat::Maya).unwrap();
         assert_eq!(entry_format, "maya");
+    }
+
+    #[test]
+    fn gguf_metadata_parses_header() {
+        // Hand-built header: architecture + context length +
+        // file_type, plus an array value the parser must skip.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"GGUF");
+        bytes.extend_from_slice(&3u32.to_le_bytes()); // version
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // tensor count
+        bytes.extend_from_slice(&4u64.to_le_bytes()); // kv count
+        fn kv(bytes: &mut Vec<u8>, key: &str, ty: u32) {
+            bytes.extend_from_slice(&(key.len() as u64).to_le_bytes());
+            bytes.extend_from_slice(key.as_bytes());
+            bytes.extend_from_slice(&ty.to_le_bytes());
+        }
+        kv(&mut bytes, "general.architecture", 8);
+        bytes.extend_from_slice(&8u64.to_le_bytes());
+        bytes.extend_from_slice(b"testarch");
+        kv(&mut bytes, "testarch.context_length", 4);
+        bytes.extend_from_slice(&131072u32.to_le_bytes());
+        kv(&mut bytes, "general.file_type", 4);
+        bytes.extend_from_slice(&15u32.to_le_bytes());
+        kv(&mut bytes, "some.array", 9);
+        bytes.extend_from_slice(&4u32.to_le_bytes()); // elem: UINT32
+        bytes.extend_from_slice(&2u64.to_le_bytes()); // count
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&2u32.to_le_bytes());
+
+        let meta = parse_gguf_metadata(&bytes);
+        assert_eq!(meta.architecture.as_deref(), Some("testarch"));
+        assert_eq!(meta.context_length, Some(131072));
+        assert_eq!(meta.file_type_label.as_deref(), Some("Q4_K_M"));
+
+        // Garbage is not a GGUF.
+        assert_eq!(parse_gguf_metadata(b"NOPE"), GgufMetadata::default());
+        // Truncation mid-KV keeps what was gathered, never panics.
+        let meta = parse_gguf_metadata(&bytes[..40]);
+        assert_eq!(meta.architecture, None);
+    }
+
+    #[test]
+    fn quantization_labels_come_from_names() {
+        assert_eq!(
+            quantization_from_file_name("Inkling-2-Mini-Q4_K_M.gguf").as_deref(),
+            Some("Q4_K_M")
+        );
+        assert_eq!(
+            quantization_from_file_name("model-q8_0.gguf").as_deref(),
+            Some("Q8_0")
+        );
+        assert_eq!(
+            quantization_from_file_name("Ornith-1.5-9B-MLX-4bit").as_deref(),
+            Some("4-bit")
+        );
+        assert_eq!(quantization_from_file_name("plain-model.gguf"), None);
     }
 
     #[test]
